@@ -14,7 +14,7 @@ Ziel:
 from __future__ import annotations
 
 from heapq import heappush, heappop
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import networkx as nx
@@ -302,24 +302,35 @@ def a_star_with_reservations(
     return None
 
 
-def compute_meeting_node(G: nx.Graph, q0: Coord, q1: Coord) -> Tuple[Coord, Dict[Coord, int], Dict[Coord, int]]:
+def compute_meeting_node(G: nx.Graph, q0: Coord, q1: Coord, reserved_meetings: set = None) -> Tuple[Coord, Dict[Coord, int], Dict[Coord, int]]:
     """
-    Wählt einen IN-Knoten, der „in der Mitte“ liegt:
-      1) minimiere die maximale Distanz (min max(d0, d1))
-      2) dann Summe der Distanzen (min d0 + d1)
-      3) dann Balance (min |d0 - d1|)
-      4) dann deterministisch nach Knoten-ID
+    Wählt einen IN-Knoten, der „in der Mitte“ liegt, aber bereits reservierte Meetings vermeidet.
     """
+    if reserved_meetings is None:
+        reserved_meetings = set()
+    
     da = nx.single_source_shortest_path_length(G, q0)
     db = nx.single_source_shortest_path_length(G, q1)
-    cands = [n for n in G if G.nodes[n]["typ"] == "IN" and n in da and n in db]
-    if not cands:
-        raise ValueError("Kein gemeinsamer IN-Knoten erreichbar.")
-    meeting = min(
-        cands,
-        key=lambda n: (max(da[n], db[n]), da[n] + db[n], abs(da[n] - db[n]), n),
+    
+    # Finde alle möglichen IN-Knoten
+    all_in_nodes = [n for n in G if G.nodes[n]["typ"] == "IN" and n in da and n in db]
+    
+    # Sortiere nach Qualität (beste zuerst)
+    sorted_candidates = sorted(
+        all_in_nodes,
+        key=lambda n: (max(da[n], db[n]), da[n] + db[n], abs(da[n] - db[n]), n)
     )
-    return meeting, da, db
+    
+    # Wähle den besten nicht-reservierten Knoten
+    for candidate in sorted_candidates:
+        if candidate not in reserved_meetings:
+            return candidate, da, db
+    
+    # Fallback: verwende den besten Knoten (auch wenn reserviert)
+    if sorted_candidates:
+        return sorted_candidates[0], da, db
+    
+    raise ValueError("Kein gemeinsamer IN-Knoten erreichbar.")
 
 
 def synchronize_to_time(path: List[TimedNode], T: int, res: Reservations) -> Optional[List[TimedNode]]:
@@ -350,8 +361,11 @@ def prioritized_pairwise_mapf(
     order: str = "longer_first",
 ) -> Tuple[List[dict], Dict[str, List[TimedNode]]]:
     infos = []
+    reserved_meetings = set()  # Track bereits verwendete Meeting-Knoten
+    
     for i, (q0, q1) in enumerate(pairs):
-        m, da, db = compute_meeting_node(G, q0, q1)
+        m, da, db = compute_meeting_node(G, q0, q1, reserved_meetings)
+        reserved_meetings.add(m)  # Reserviere diesen Meeting-Knoten
         infos.append({
             "pair_id": i,
             "q0": q0,
@@ -371,7 +385,6 @@ def prioritized_pairwise_mapf(
     res = Reservations(G)
     plans: Dict[str, List[TimedNode]] = {}
 
-    # NEU: Buchhaltung, wer wann an welchem IN angekommen ist und ob bereits „ausgeparkt“ wurde
     meeting_log: Dict[Coord, List[dict]] = defaultdict(list)
 
     for p in plan_order:
@@ -404,7 +417,6 @@ def prioritized_pairwise_mapf(
         plans[aid] = a
         plans[bid] = b
 
-        # NEU: Vorherige Paare am gleichen IN in Schritt Tm „ausparken“
         if meeting_log[meeting]:
             for rec in meeting_log[meeting]:
                 if not rec.get("evacuated") and rec["T"] < Tm:
@@ -412,8 +424,6 @@ def prioritized_pairwise_mapf(
                     if ok:
                         rec["evacuated"] = True
 
-        # 2) Falls es bereits spätere Ankünfte an diesem IN gibt,
-        #    das *aktuelle* Paar vorab so erweitern, dass es bei T_next ausparkt.
         later_times = [rec["T"] for rec in meeting_log[meeting] if rec["T"] > Tm and not rec.get("evacuated")]
         evacuated_now = False
         if later_times:
@@ -421,7 +431,6 @@ def prioritized_pairwise_mapf(
             ok = _egress_pair_at_time(G, meeting, [aid, bid], plans, T_next, res)
             evacuated_now = bool(ok)
 
-        # Logging dieses Paars (evacuated=True falls vorab-Ausparken erfolgreich)
         meeting_log[meeting].append({
             "agents": [aid, bid],
             "T": Tm,
@@ -433,19 +442,20 @@ def prioritized_pairwise_mapf(
 
 
 # --------------
-# Beispiel-Usage
+# Main
 # --------------
 
 if __name__ == "__main__":
     G = build_network()
-    #pairs = [((1, -2), (1, 0)), ((-1, 0), (3, -2))]
     #pairs = [((3, 0), (-1, -2)), ((-1, 0), (3, -2))]
     #pairs = [((1, -2), (1, 0)), ((-1, 0), (3, -2)), ((0, -3), (2, 1))]
+    #pairs = [((1, -2), (1, 0)), ((-1, 0), (3, -2)), ((0, -3), (2, 1)), ((2, -3), (3, 0))]
+    #pairs = [((1, -2), (1, 0)), ((-1, 0), (3, -2)), ((0, -3), (2, 1)), ((2, -3), (3, 0)), ((2, -1), (0, 1))]
+    pairs = [((1, -2), (1, 0)), ((-1, 0), (3, -2)), ((0, -3), (2, 1)), ((2, -3), (3, 0)), ((2, -1), (0, 1)),((0, -1), (-1, -2))]
     _, plans = prioritized_pairwise_mapf(G, pairs)
 
     for agent_id, path in plans.items():
         trace = " -> ".join(f"{n}@t{t}" for n, t in path)
         print(f"{agent_id}: {trace}")
 
-    # Animation (falls verfügbar)
     animate_mapf(G, plans)

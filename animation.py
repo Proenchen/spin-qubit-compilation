@@ -62,7 +62,7 @@ def _make_step_positions(path):
     positions = [per_t[t] for t in frames]
     return positions, frames, len(positions) - 1
 
-def animate_mapf(G, plans, interval_ms=300, smooth=True, substeps=3):
+def animate_mapf(G, plans, interval_ms=500, smooth=True, substeps=4):
     """
     Animate moving qubits over the grid, ohne Start- und Endmarker.
     """
