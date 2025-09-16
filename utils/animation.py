@@ -62,32 +62,29 @@ def _make_step_positions(path):
     positions = [per_t[t] for t in frames]
     return positions, frames, len(positions) - 1
 
-def animate_mapf(G, plans, interval_ms=500, smooth=True, substeps=4):
+def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=300):
     """
     Animate moving qubits over the grid, ohne Start- und Endmarker.
     """
-    # --- prepare background drawing (grid + node types) ---
     pos = {n: n for n in G}
     fig, ax = plt.subplots(figsize=(8, 8))
     nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.3)
     nx.draw_networkx_nodes(
-        G, pos, nodelist=[n for n, d in G.nodes(data=True) if d["typ"] == "IN"],
+        G, pos, nodelist=[n for n, d in G.nodes(data=True) if d["type"] == "IN"],
         node_shape="s", node_size=NODE_SIZE, ax=ax
     )
     nx.draw_networkx_nodes(
-        G, pos, nodelist=[n for n, d in G.nodes(data=True) if d["typ"] == "SN"],
+        G, pos, nodelist=[n for n, d in G.nodes(data=True) if d["type"] == "SN"],
         node_shape="o", node_size=NODE_SIZE, ax=ax
     )
     ax.set_aspect("equal")
     ax.axis("off")
     fig.tight_layout()
 
-    # --- colors and agent ordering (stable across runs) ---
     colors = ["tab:red","tab:green","tab:orange","tab:purple",
               "tab:brown","tab:pink","tab:gray","tab:olive","tab:cyan"]
     agent_ids = list(plans.keys())
 
-    # --- build per-agent timelines ---
     agent_data = []
     global_frames = set()
     for idx, aid in enumerate(agent_ids):
@@ -114,7 +111,6 @@ def animate_mapf(G, plans, interval_ms=500, smooth=True, substeps=4):
         data["first_frame"] = data["frames"][0] if data["frames"] else None
         data["last_frame"]  = data["frames"][-1] if data["frames"] else None
 
-    # --- only moving artists (no start/end markers) ---
     moving_artists = []
     for data in agent_data:
         col = data["color"]
