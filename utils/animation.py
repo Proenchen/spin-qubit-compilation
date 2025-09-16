@@ -63,11 +63,11 @@ def _make_step_positions(path):
     return positions, frames, len(positions) - 1
 
 def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=300):
-    """
-    Animate moving qubits over the grid, ohne Start- und Endmarker.
-    """
     pos = {n: n for n in G}
-    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # constrained_layout=True kümmert sich um Platz für die Legende
+    fig, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
+
     nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.3)
     nx.draw_networkx_nodes(
         G, pos, nodelist=[n for n, d in G.nodes(data=True) if d["type"] == "IN"],
@@ -79,11 +79,15 @@ def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=300):
     )
     ax.set_aspect("equal")
     ax.axis("off")
-    fig.tight_layout()
 
     colors = ["tab:red","tab:green","tab:orange","tab:purple",
               "tab:brown","tab:pink","tab:gray","tab:olive","tab:cyan"]
-    agent_ids = list(plans.keys())
+
+    # Agent-IDs numerisch sortieren
+    def _qid_sort_key(aid):
+        s = str(aid)
+        return (0, int(s)) if s.lstrip("-").isdigit() else (1, s)
+    agent_ids = sorted(list(plans.keys()), key=_qid_sort_key)
 
     agent_data = []
     global_frames = set()
@@ -112,6 +116,8 @@ def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=300):
         data["last_frame"]  = data["frames"][-1] if data["frames"] else None
 
     moving_artists = []
+    legend_handles = []
+    legend_labels = []
     for data in agent_data:
         col = data["color"]
         p0 = data["positions"][0] if data["frames"] else (0, 0)
@@ -119,6 +125,15 @@ def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=300):
                        markeredgecolor="black", markeredgewidth=1.2,
                        linestyle="None", color=col, alpha=0.95, zorder=4)
         moving_artists.append(dot)
+        legend_handles.append(plt.Line2D([0],[0], marker="o", color="w",
+                                         markerfacecolor=col, markeredgecolor="black",
+                                         markersize=8))
+        legend_labels.append(f"Qubit {data['aid']}")
+
+    # Legende rechts außerhalb platzieren
+    ax.legend(legend_handles, legend_labels,
+              loc="center left", bbox_to_anchor=(1.00, 0.5),
+              frameon=True)
 
     def get_agent_pos_for_frame(data, gf):
         if gf in data["frame_to_pos"]:
