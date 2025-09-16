@@ -1,25 +1,3 @@
-"""
-Rendezvous + MAPF (refactored, same functionality)
---------------------------------------------------
-Goal:
-- For each qubit pair, pick an "in-the-middle" IN node (by shortest paths)
-- Move both qubits collision-free to arrive there at the same time
-- IN nodes have capacity 2 (allow rendezvous), SN nodes capacity 1
-- Collision-free via time reservations on nodes/edges; forbid edge-swaps
-- A*: lexicographic cost (minimize moves first, then time) so waiting is preferred
-
-Notes on this refactor (behavior unchanged):
-- The original pure functions are organized into small classes with clear roles:
-  * NetworkBuilder: builds the 2x2-tiled graph
-  * Reservations: unchanged; manages time-indexed capacities
-  * AStar: A* search with lexicographic cost + reservation checks
-  * RendezvousPlanner: end-to-end pairwise planning with meeting selection,
-    synchronization, and staged egress from IN nodes
-- Helper utilities keep their original semantics; names are preserved where useful
-- Added English comments for each logical unit; original German docstrings were translated
-- The `main` block mirrors the original execution path
-"""
-
 from __future__ import annotations
 
 from heapq import heappush, heappop
