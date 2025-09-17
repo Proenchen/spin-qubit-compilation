@@ -162,7 +162,7 @@ class RoutingPlanner:
         G: nx.Graph,
         pairs: List[Tuple[Qubit, Qubit]],
         fixed_meetings: Optional[Dict[frozenset, Coord]] = None,
-        occupied_nodes: Optional[Set[Coord]] = None,
+        occupied_nodes: Optional[Set[Coord]] = None
     ) -> Dict[int, List[TimedNode]]:
         """
         Plan a batch of pairs. If synchronization at the meeting node fails,
@@ -285,6 +285,7 @@ class RoutingPlanner:
         G: nx.Graph,
         qubits: List[Qubit],
         pairs: List[Tuple[Qubit, Qubit]],
+        p_success: int = P_SUCCESS
     ) -> Dict[int, List[TimedNode]]:
         """
         - Each qubit has success probability P_SUCCESS.
@@ -387,7 +388,7 @@ class RoutingPlanner:
                     mnode = meeting_of_pair[pair_key]
 
                     if not success[a_id]:
-                        a_success = (random.random() < P_SUCCESS)
+                        a_success = (random.random() < p_success)
                         if a_success:
                             success[a_id] = True
                             current_pos[a_id] = mnode  # remains at meeting and waits
@@ -397,7 +398,7 @@ class RoutingPlanner:
                         current_pos[a_id] = mnode
 
                     if not success[b_id]:
-                        b_success = (random.random() < P_SUCCESS)
+                        b_success = (random.random() < p_success)
                         if b_success:
                             success[b_id] = True
                             current_pos[b_id] = mnode
@@ -421,6 +422,7 @@ class RoutingPlanner:
         G: nx.Graph,
         qubits: List[Qubit],
         pairs: List[Tuple[Qubit, Qubit]],
+        p_success: int = P_SUCCESS
     ) -> Dict[int, List[TimedNode]]:
         """
         Interleaved strategy with co-scheduling and hard meeting locks:
@@ -624,7 +626,7 @@ class RoutingPlanner:
 
                 # a
                 if not pending_success[pidx][a_id]:
-                    a_success = (random.random() < P_SUCCESS)
+                    a_success = (random.random() < p_success)
                     if a_success:
                         pending_success[pidx][a_id] = True
                         current_pos[a_id] = mnode
@@ -635,7 +637,7 @@ class RoutingPlanner:
 
                 # b
                 if not pending_success[pidx][b_id]:
-                    b_success = (random.random() < P_SUCCESS)
+                    b_success = (random.random() < p_success)
                     if b_success:
                         pending_success[pidx][b_id] = True
                         current_pos[b_id] = mnode
@@ -807,7 +809,7 @@ class RoutingPlanner:
 
 if __name__ == "__main__":
     G = NetworkBuilder.build_network()
-    random.seed(42)
+    random.seed(668)
 
     qubits: List[Qubit] = [
         Qubit(0, (1, -2)),
@@ -832,7 +834,18 @@ if __name__ == "__main__":
     ]
 
     planner = RoutingPlanner()
-    # routing_plan = planner.try_until_success(G, qubits, pairs)
+    #routing_plan = planner.try_until_success(G, qubits, pairs)
     routing_plan = planner.interleaved_routing(G, qubits, pairs)
 
+    # Get total number of steps
+    max_time = max(path[-1][1] for path in routing_plan.values())
+    print(f"Total number of time steps: {max_time}")
+
+    # Print positions of all qubits at each step
+    for t in range(max_time + 1):
+        positions = {qid: next(coord for (coord, tt) in routing_plan[qid] if tt == t)
+                     for qid in routing_plan}
+        print(f"t={t}: {positions}")
+
+    # Animate
     animate_mapf(G, routing_plan)
