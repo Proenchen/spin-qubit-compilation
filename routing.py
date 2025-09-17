@@ -124,9 +124,13 @@ class RoutingPlanner:
     """Orchestrates meeting-node selection and MAPF for pairs with egress staging."""
 
     @staticmethod
-    def compute_meeting_node(
+    def meeting_candidates(
         G: nx.Graph, q0: Coord, q1: Coord, reserved_meetings: Optional[Set[Coord]] = None
-    ) -> Optional[Tuple[Coord, Dict[Coord, int], Dict[Coord, int]]]:
+    ) -> List[Coord]:
+        """
+        Liefert die sortierte Kandidatenliste von IN-Knoten (gleiche Ranking-Logik wie compute_meeting_node),
+        filtert bereits reservierte Meetings raus.
+        """
         if reserved_meetings is None:
             reserved_meetings = set()
 
@@ -144,11 +148,7 @@ class RoutingPlanner:
                            n)
         )
 
-        for candidate in sorted_candidates:
-            if candidate not in reserved_meetings:
-                return candidate, q0_bfs_dist, q1_bfs_dist
-
-        raise RuntimeError("No common unreserved meeting node reachable.")
+        return [c for c in sorted_candidates if c not in reserved_meetings]
 
     @staticmethod
     def pairwise_mapf(
@@ -255,33 +255,13 @@ class RoutingPlanner:
                 raise RuntimeError(f"No feasible meeting (with sync) for pair {qa.id}-{qb.id}")
 
         return plans
-
-    @staticmethod
-    def extend_waits(
-        path: List[TimedNode],
-        target_time: int,
-        res: Reservations,
-    ) -> Optional[List[TimedNode]]:
-        if not path:
-            return None
-
-        ext = path.copy()
-        while ext[-1][1] < target_time:
-            n, t = ext[-1]
-            t2 = t + 1
-            if not res.can_occupy(n, t2):
-                return None
-            res.occupy_node(n, t2)
-            ext.append((n, t2))
-        return ext
-
-    # >>> NEW: Batch-Orchestrierung für wiederholte Qubit-Interaktionen
+    
     @staticmethod
     def plan_in_batches(
         G: nx.Graph,
         qubits: List[Qubit],
         pairs: List[Tuple[Qubit, Qubit]],
-    ) -> Tuple[List[Dict[int, List[TimedNode]]], Dict[int, Coord]]:
+    ) -> Dict[int, List[TimedNode]]:
         """
         Zerlegt die 'pairs' in Batches ohne Qubit-Überschneidung. Sobald ein Paar ein
         bereits in der Batch enthaltenes Qubit verwenden würde, wird die aktuelle
@@ -343,97 +323,93 @@ class RoutingPlanner:
             # Der Konflikt-Auslöser wird in der nächsten Runde erneut betrachtet
             i = j
 
-        return batch_plans, current_pos
+        return RoutingPlanner.stitch_batches(qubits, batch_plans)
+    
+
+    # Helpers
+    #--------------------------------------------
+
+    @staticmethod
+    def extend_waits(
+        path: List[TimedNode],
+        target_time: int,
+        res: Reservations,
+    ) -> Optional[List[TimedNode]]:
+        if not path:
+            return None
+
+        ext = path.copy()
+        while ext[-1][1] < target_time:
+            n, t = ext[-1]
+            t2 = t + 1
+            if not res.can_occupy(n, t2):
+                return None
+            res.occupy_node(n, t2)
+            ext.append((n, t2))
+        return ext
     
     @staticmethod
-    def meeting_candidates(
-        G: nx.Graph, q0: Coord, q1: Coord, reserved_meetings: Optional[Set[Coord]] = None
-    ) -> List[Coord]:
+    def stitch_batches(
+        qubits: List[Qubit],
+        batch_plans: List[Dict[int, List[TimedNode]]],
+    ) -> Dict[int, List[TimedNode]]:
         """
-        Liefert die sortierte Kandidatenliste von IN-Knoten (gleiche Ranking-Logik wie compute_meeting_node),
-        filtert bereits reservierte Meetings raus.
+        Nimmt die per-Batch-Pläne (Zeit jeweils ab 0) und erzeugt einen
+        globalen Plan {qubit_id -> [(coord, t), ...]} mit durchlaufender Zeitachse.
+        Qubits, die in einer Batch nicht aktiv sind, warten an ihrer aktuellen Position.
         """
-        if reserved_meetings is None:
-            reserved_meetings = set()
-
-        q0_bfs_dist = nx.single_source_shortest_path_length(G, q0)
-        q1_bfs_dist = nx.single_source_shortest_path_length(G, q1)
-        all_in_nodes = [n for n in G
-                        if G.nodes[n]["type"] == "IN"
-                        and n in q0_bfs_dist and n in q1_bfs_dist]
-
-        sorted_candidates = sorted(
-            all_in_nodes,
-            key=lambda n: (max(q0_bfs_dist[n], q1_bfs_dist[n]),
-                           q0_bfs_dist[n] + q1_bfs_dist[n],
-                           abs(q0_bfs_dist[n] - q1_bfs_dist[n]),
-                           n)
-        )
-
-        return [c for c in sorted_candidates if c not in reserved_meetings]
-
-
-def stitch_batches(
-    qubits: List[Qubit],
-    batch_plans: List[Dict[int, List[TimedNode]]],
-) -> Dict[int, List[TimedNode]]:
-    """
-    Nimmt die per-Batch-Pläne (Zeit jeweils ab 0) und erzeugt einen
-    globalen Plan {qubit_id -> [(coord, t), ...]} mit durchlaufender Zeitachse.
-    Qubits, die in einer Batch nicht aktiv sind, warten an ihrer aktuellen Position.
-    """
-    # Start-Positionen aus dem allerersten Zustand ableiten
-    initial_pos: Dict[int, Coord] = {}
-    for q in qubits:
-        initial_pos[q.id] = q.pos
-
-    timelines: Dict[int, List[TimedNode]] = {q.id: [(initial_pos[q.id], 0)] for q in qubits}
-    current_pos: Dict[int, Coord] = initial_pos.copy()
-
-    t_offset = 0  # globaler Zeitversatz
-
-    for plans in batch_plans:
-        # Dauer der Batch (maximale Endzeit in dieser Batch)
-        if not plans:
-            continue
-        batch_T = max(path[-1][1] for path in plans.values())
-
-        # 1) Für alle Qubits, die in dieser Batch aktiv sind: Plan mit Zeitversatz einfügen
+        # Start-Positionen aus dem allerersten Zustand ableiten
+        initial_pos: Dict[int, Coord] = {}
         for q in qubits:
-            qid = q.id
-            last_coord, last_t = timelines[qid][-1]
+            initial_pos[q.id] = q.pos
 
-            if qid in plans:
-                # Zeiten dieser Batch um t_offset verschieben
-                shifted = [(coord, t + t_offset) for (coord, t) in plans[qid]]
+        timelines: Dict[int, List[TimedNode]] = {q.id: [(initial_pos[q.id], 0)] for q in qubits}
+        current_pos: Dict[int, Coord] = initial_pos.copy()
 
-                # Sicherstellen, dass die Timeline bis zum Batch-Start gefüllt ist
-                if last_t < t_offset:
-                    # warte am Platz bis t_offset
-                    for tt in range(last_t + 1, t_offset + 1):
-                        timelines[qid].append((last_coord, tt))
-                    last_coord, last_t = timelines[qid][-1]
+        t_offset = 0  # globaler Zeitversatz
 
-                # Doppelten Startknoten vermeiden, falls identisch
-                if timelines[qid][-1] == shifted[0]:
-                    timelines[qid].extend(shifted[1:])
+        for plans in batch_plans:
+            # Dauer der Batch (maximale Endzeit in dieser Batch)
+            if not plans:
+                continue
+            batch_T = max(path[-1][1] for path in plans.values())
+
+            # 1) Für alle Qubits, die in dieser Batch aktiv sind: Plan mit Zeitversatz einfügen
+            for q in qubits:
+                qid = q.id
+                last_coord, last_t = timelines[qid][-1]
+
+                if qid in plans:
+                    # Zeiten dieser Batch um t_offset verschieben
+                    shifted = [(coord, t + t_offset) for (coord, t) in plans[qid]]
+
+                    # Sicherstellen, dass die Timeline bis zum Batch-Start gefüllt ist
+                    if last_t < t_offset:
+                        # warte am Platz bis t_offset
+                        for tt in range(last_t + 1, t_offset + 1):
+                            timelines[qid].append((last_coord, tt))
+                        last_coord, last_t = timelines[qid][-1]
+
+                    # Doppelten Startknoten vermeiden, falls identisch
+                    if timelines[qid][-1] == shifted[0]:
+                        timelines[qid].extend(shifted[1:])
+                    else:
+                        timelines[qid].extend(shifted)
+
+                    current_pos[qid] = shifted[-1][0]
                 else:
-                    timelines[qid].extend(shifted)
+                    # 2) Nicht beteiligte Qubits warten über die Batch-Dauer
+                    # Wir füllen jeden Zeitschritt bis t_offset + batch_T
+                    target_t = t_offset + batch_T
+                    if last_t < target_t:
+                        for tt in range(last_t + 1, target_t + 1):
+                            timelines[qid].append((last_coord, tt))
+                        current_pos[qid] = last_coord
 
-                current_pos[qid] = shifted[-1][0]
-            else:
-                # 2) Nicht beteiligte Qubits warten über die Batch-Dauer
-                # Wir füllen jeden Zeitschritt bis t_offset + batch_T
-                target_t = t_offset + batch_T
-                if last_t < target_t:
-                    for tt in range(last_t + 1, target_t + 1):
-                        timelines[qid].append((last_coord, tt))
-                    current_pos[qid] = last_coord
+            t_offset += batch_T
 
-        # Nächster Zeitversatz
-        t_offset += batch_T
+        return timelines
 
-    return timelines
 
 if __name__ == "__main__":
     G = NetworkBuilder.build_network()
@@ -447,7 +423,6 @@ if __name__ == "__main__":
         Qubit(5, (2,  1))
     ]
 
-    # Beispiel: Längere Sequenz, in der Qubits mehrfach vorkommen dürfen
     pairs: List[Tuple[Qubit, Qubit]] = [
         (qubits[0], qubits[1]),  
         (qubits[0], qubits[2]),
@@ -462,22 +437,7 @@ if __name__ == "__main__":
     ]
 
     planner = RoutingPlanner()
+    routing_plan = planner.plan_in_batches(G, qubits, pairs)
 
-    # >>> NEW: Batches planen & Positionen fortschreiben
-    batch_plans, final_positions = planner.plan_in_batches(G, qubits, pairs)
-    global_plans = stitch_batches(qubits, batch_plans)
+    animate_mapf(G, routing_plan)
 
-
-    # Ausgabe
-    for b_idx, plans in enumerate(batch_plans):
-        print(f"\n=== Batch {b_idx} ===")
-        for qubit_id, path in plans.items():
-            trace = " -> ".join(f"{n}@t{t}" for n, t in path)
-            print(f"{qubit_id}: {trace}")
-
-
-    animate_mapf(G, global_plans)
-
-    print("\nFinale Positionen:")
-    for q in qubits:
-        print(f"Qubit {q.id}: {final_positions[q.id]}")

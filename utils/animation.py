@@ -87,7 +87,7 @@ def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=300):
     def _qid_sort_key(aid):
         s = str(aid)
         return (0, int(s)) if s.lstrip("-").isdigit() else (1, s)
-    agent_ids = sorted(list(plans.keys()), key=_qid_sort_key)
+    agent_ids = sorted(plans.keys(), key=_qid_sort_key)
 
     agent_data = []
     global_frames = set()
