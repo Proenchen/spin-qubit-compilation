@@ -62,7 +62,7 @@ def _make_step_positions(path):
     positions = [per_t[t] for t in frames]
     return positions, frames, len(positions) - 1
 
-def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=300):
+def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=200):
     pos = {n: n for n in G}
 
     # constrained_layout=True kümmert sich um Platz für die Legende
