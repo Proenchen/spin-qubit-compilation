@@ -24,7 +24,7 @@ class Qubit:
     pos: Coord
 
 MAX_TIME = 300
-P_SUCCESS = 1
+P_SUCCESS = 0.8
 
 
 class Reservations:
@@ -308,18 +308,23 @@ class RoutingPlanner:
         p_success: float = P_SUCCESS
     ) -> Dict[int, List[TimedNode]]:
         """
-        Synchronisierte Attempt-Logik pro Batch mit PRE-IN-Konfliktvermeidung:
+        Synchronisierte Attempt-Logik pro Batch mit:
+        - PRE-IN-Konfliktvermeidung (pro PRE-IN max. ein Paar je Microbatch)
+        - Verbot, über Startpositionen anderer Batch-Qubits zu routen, solange diese
+        ihren Meeting-Knoten (IN) noch nicht erreicht haben (bei Verstoß: Zurückstellen).
+        - NEU: Falls nur ein Qubit eines Paars erfolgreich ist, wartet es am PRE-IN.
+            Beide fahren erst dann gemeinsam in den IN, wenn beide erfolgreich sind.
 
-        1) Alle Qubits der Attempt-Batch laufen zunächst nur bis PRE-IN und warten
-        global bis alle am PRE-IN sind (T_pre).
-        2) Danach: Erfolg -> Schritt PRE-IN -> Meeting bei T_pre+1; Misserfolg -> Reset-Sprung
-        zurück zur Batch-Startposition bei T_pre+1.
-        3) Globaler Meeting-Sync (durch simultanes T_pre+1 gegeben).
-        4) Wenn mehrere Paare denselben PRE-IN zur selben Zeit T_pre belegen würden, wird
-        in diesem Microbatch nur EIN Paar pro PRE-IN zugelassen; die übrigen Paare
-        werden für diesen Attempt zurückgestellt (bleiben sichtbar am Batch-Start).
-        5) Wiederholen, bis alle Paare des Batches komplett erfolgreich sind.
-        6) Gemeinsamer Egress-Microbatch mit Fallback auf nächstgelegene freie SNs.
+        Ablauf:
+        1) Anmarsch bis PRE-IN, globales Warten bis T_pre.
+        2) Bei T_pre+1: Erfolg/Misserfolg wird ausgewürfelt.
+        - Beidseitiger Erfolg: beide fahren synchron in den IN.
+        - Nur einseitiger Erfolg: erfolgreiches Qubit bleibt am PRE-IN, anderes resetet zum Batch-Start.
+        - Beidseitiger Misserfolg: beide reseten zum Batch-Start.
+        3) Microbatch umfasst nur Paare ohne PRE-IN-Konflikte und ohne Verstoß gegen Startknoten-Regel.
+        Paare, die gegen die Regeln verstoßen, werden für diesen Attempt zurückgestellt (warten sichtbar).
+        4) Wiederholen, bis alle Paare des Batches erfolgreich sind.
+        5) Gemeinsamer Egress-Microbatch.
         """
 
         current_pos: Dict[int, Coord] = {q.id: q.pos for q in qubits}
@@ -363,15 +368,11 @@ class RoutingPlanner:
             last_paths_of_pair: Dict[frozenset, Dict[int, List[TimedNode]]] = {}
 
             def plan_egress_for_whole_batch() -> None:
-                """Gemeinsamer Egress-Microbatch für alle Paare des Batches.
-                Fallback: falls kein PRE-IN ermittelbar oder belegt, wähle das
-                nächstgelegene freie SN via BFS vom Meeting aus."""
                 return_starts: Dict[int, Coord] = {}
                 raw_targets: Dict[int, Coord] = {}
                 approach_paths: Dict[int, List[TimedNode]] = {}
                 meet_of_qid: Dict[int, Coord] = {}
 
-                # Entry-SNs aus letzter Anmarschplanung ableiten
                 for a_id, b_id in id_pairs:
                     pkey = frozenset({a_id, b_id})
                     if pkey not in last_meeting_of_pair or pkey not in last_paths_of_pair:
@@ -388,34 +389,28 @@ class RoutingPlanner:
                     a_entry_sn = RoutingPlanner._entry_sn_from_path(a_path, mnode)
                     b_entry_sn = RoutingPlanner._entry_sn_from_path(b_path, mnode)
 
-                    # Start des Egress ist immer das Meeting
                     return_starts[a_id] = mnode
                     return_starts[b_id] = mnode
 
-                    # Primärziel ist der PRE-IN; wenn None -> später Fallback
                     if a_entry_sn is not None:
                         raw_targets[a_id] = a_entry_sn
                     if b_entry_sn is not None:
                         raw_targets[b_id] = b_entry_sn
 
                 if not return_starts:
-                    return  # nichts zu egressen
+                    return
 
-                # aktuell belegte Knoten
                 occupied_now: Set[Coord] = {current_pos[q.id] for q in qubits}
                 egress_qids: Set[int] = set(return_starts.keys())
 
-                # blockiere beim Routing alle Knoten von Qubits, die NICHT egressen
                 blocked_nodes_for_paths: Set[Coord] = {
                     pos for qid, pos in current_pos.items() if qid not in egress_qids
                 }
 
-                # Ziel-Deduplizierung
                 claimed: Set[Coord] = set()
                 return_targets: Dict[int, Coord] = {}
 
                 def first_alternative_sn(qid: int, avoid: Set[Coord]) -> Optional[Coord]:
-                    """Gehe den Anmarschpfad rückwärts; wähle das erste SN, das frei ist."""
                     path = approach_paths[qid]
                     meet = path[-1][0]
                     first_meet_idx = None
@@ -434,7 +429,6 @@ class RoutingPlanner:
                 def cheb(a: Coord, b: Coord) -> int:
                     return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
 
-                # schwierigere zuerst
                 order = sorted(
                     return_starts.keys(),
                     key=lambda qid: cheb(return_starts[qid], raw_targets.get(qid, return_starts[qid])),
@@ -448,25 +442,20 @@ class RoutingPlanner:
                     tgt = raw_targets.get(qid)
 
                     pick = None
-                    # 1) bevorzugt: PRE-IN (falls vorhanden & frei)
                     if tgt is not None and tgt not in avoid:
                         pick = tgt
                     else:
-                        # 2) Alternative entlang des Anmarschpfads
                         alt = first_alternative_sn(qid, avoid)
                         if alt is not None:
                             pick = alt
                         else:
-                            # 3) Fallback: nächstgelegenes freies SN vom Meeting aus (BFS)
                             meet = meet_of_qid[qid]
                             pick = RoutingPlanner._nearest_free_sn(G, meet, avoid)
 
                     if pick is not None:
                         return_targets[qid] = pick
                         claimed.add(pick)
-                    # Falls None → dieses Qubit egressed nicht in diesem Microbatch (selten)
 
-                # nur Qubits mit Ziel egressen lassen
                 starts_exec = {qid: s for qid, s in return_starts.items() if qid in return_targets}
                 targets_exec = {qid: return_targets[qid] for qid in starts_exec}
                 if not starts_exec:
@@ -477,56 +466,118 @@ class RoutingPlanner:
                 )
                 batch_plans.append(return_plans)
 
-                # Positionen aktualisieren
                 for qid, rpath in return_plans.items():
                     current_pos[qid] = rpath[-1][0]
 
             # Attempts, bis alle Paare des Batches fertig sind
             while True:
-                # fertig?
                 if all(success[a] and success[b] for (a, b) in id_pairs):
                     plan_egress_for_whole_batch()
                     break
 
-                # pending Paare
                 pending_pairs_ids = [(a, b) for (a, b) in id_pairs if not (success[a] and success[b])]
 
-                # Attempt-Paare aus aktuellen Positionen
-                attempt_pairs: List[Tuple[Qubit, Qubit]] = []
-                for a_id, b_id in pending_pairs_ids:
-                    qa_now = Qubit(a_id, current_pos[a_id])
-                    qb_now = Qubit(b_id, current_pos[b_id])
-                    attempt_pairs.append((qa_now, qb_now))
+                # --------- Auswahl-Loop: Paare, die REGELN erfüllen, in diesem Attempt planen ---------
+                active_pairs_ids = list(pending_pairs_ids)
+                attempt_full: Dict[int, List[TimedNode]] = {}
+                meeting_of_pair: Dict[frozenset, Coord] = {}
 
-                occupied_now_for_meet: Set[Coord] = {current_pos[q.id] for q in qubits}
+                # Menge der Startknoten aller Pending-Qubits (für spätere Verbotsprüfung)
+                all_pending_starts: Dict[int, Coord] = {qid: batch_start_pos[qid]
+                                                        for (a, b) in pending_pairs_ids
+                                                        for qid in (a, b)}
 
-                # Planung bis zum Meeting (liefert kollisionsfreie Anmarschpfade)
-                attempt_full = RoutingPlanner.pairwise_mapf(
-                    G,
-                    attempt_pairs,
-                    fixed_meetings=fixed_meetings,
-                    occupied_nodes=occupied_now_for_meet,
-                )
+                while True:
+                    if not active_pairs_ids:
+                        # Niemand passt gemeinsam → mindestens das erste Pending-Paar alleine versuchen
+                        active_pairs_ids = [pending_pairs_ids[0]]
 
-                # Für die Timeline einen Microbatch vorbereiten (wir füllen ihn gleich)
+                    # Aktuelle Positionsobjekte
+                    attempt_pairs: List[Tuple[Qubit, Qubit]] = []
+                    for a_id, b_id in active_pairs_ids:
+                        qa_now = Qubit(a_id, current_pos[a_id])
+                        qb_now = Qubit(b_id, current_pos[b_id])
+                        attempt_pairs.append((qa_now, qb_now))
+
+                    occupied_now_for_meet: Set[Coord] = {current_pos[q.id] for q in qubits}
+
+                    # Anmarsch-Planung (liefert kollisionsfreie Anmarschpfade bis Meeting)
+                    attempt_full = RoutingPlanner.pairwise_mapf(
+                        G,
+                        attempt_pairs,
+                        fixed_meetings=fixed_meetings,
+                        occupied_nodes=occupied_now_for_meet,
+                    )
+
+                    # Meetings puffern
+                    meeting_of_pair.clear()
+                    for a_id, b_id in active_pairs_ids:
+                        pkey = frozenset({a_id, b_id})
+                        meet = attempt_full[a_id][-1][0]
+                        meeting_of_pair[pkey] = meet
+
+                    # --- Regel 2 prüfen: keine Nutzung fremder Startknoten bis zum Meeting ---
+                    violating_pairs: Set[Tuple[int, int]] = set()
+
+                    # Hilfsmap: qid -> verbotene Startknoten (alle anderen Pending außer sich selbst)
+                    forbidden_start_for_q: Dict[int, Set[Coord]] = {}
+                    for (a_id, b_id) in active_pairs_ids:
+                        forbidden_start_for_q[a_id] = set(
+                            pos for qid, pos in all_pending_starts.items() if qid != a_id
+                        )
+                        forbidden_start_for_q[b_id] = set(
+                            pos for qid, pos in all_pending_starts.items() if qid != b_id
+                        )
+
+                    def path_uses_forbidden_start_before_meet(path: List[TimedNode], meet: Coord, forb: Set[Coord]) -> bool:
+                        first_meet_idx = None
+                        for ii, (c, _) in enumerate(path):
+                            if c == meet:
+                                first_meet_idx = ii
+                                break
+                        if first_meet_idx is None:
+                            nodes_to_check = [c for (c, _) in path]
+                        else:
+                            nodes_to_check = [c for (c, _) in path[:first_meet_idx]]
+                        return any(c in forb for c in nodes_to_check)
+
+                    for a_id, b_id in active_pairs_ids:
+                        pkey = frozenset({a_id, b_id})
+                        meet = meeting_of_pair[pkey]
+
+                        for qid in (a_id, b_id):
+                            if path_uses_forbidden_start_before_meet(
+                                attempt_full[qid], meet, forbidden_start_for_q[qid]
+                            ):
+                                violating_pairs.add((a_id, b_id))
+                                break  # Paar markiert, nächste Paarprüfung
+
+                    if not violating_pairs:
+                        break  # aktuelle Active-Menge ist ok
+
+                    # Entferne alle verletzenden Paare, versuche mit Rest erneut
+                    active_pairs_ids = [p for p in active_pairs_ids if p not in violating_pairs]
+                    # Falls alles entfernt wurde, wähle eines (erstes) Solo (wird oben behandelt)
+                    continue
+                # --------- Ende Auswahl-Loop ---------
+
+                # Für Timeline einen Microbatch vorbereiten
                 batch_plans.append({})
                 micro_idx = len(batch_plans) - 1
 
-                # Meeting je pending Paar + Pufferung
-                meeting_of_pair: Dict[frozenset, Coord] = {}
-                for a_id, b_id in pending_pairs_ids:
+                # Meetings & Puffer für die aktiven Paare (nur diese wurden geplant)
+                last_paths_of_pair.update({
+                    frozenset({a, b}): {a: attempt_full[a], b: attempt_full[b]}
+                    for (a, b) in active_pairs_ids
+                })
+                for a_id, b_id in active_pairs_ids:
                     pkey = frozenset({a_id, b_id})
                     meet = attempt_full[a_id][-1][0]
-                    meeting_of_pair[pkey] = meet
                     last_meeting_of_pair[pkey] = meet
-                    last_paths_of_pair[pkey] = {
-                        a_id: attempt_full[a_id],
-                        b_id: attempt_full[b_id],
-                    }
 
-                # -------- Phase 1: PRE-IN global synchronisieren --------
+                # -------- Phase 1: PRE-IN global synchronisieren (nur aktive Paare) --------
                 pre_in_arrival_times: Dict[int, int] = {}
-                for a_id, b_id in pending_pairs_ids:
+                for a_id, b_id in active_pairs_ids:
                     pkey = frozenset({a_id, b_id})
                     meet = meeting_of_pair[pkey]
                     for qid in (a_id, b_id):
@@ -535,11 +586,22 @@ class RoutingPlanner:
                             raise RuntimeError("Fehler: PRE-IN nicht gefunden.")
                         pre_in_arrival_times[qid] = t_pre
 
+                # Wenn aufgrund Rückstellungen keine aktiven Paare existieren, lasse alle warten
+                if not pre_in_arrival_times:
+                    # Sichtbares Warten aller Pending-Qubits für einen Zeitschritt
+                    wait_only: Dict[int, List[TimedNode]] = {}
+                    for (a_id, b_id) in pending_pairs_ids:
+                        for qid in (a_id, b_id):
+                            wait_only[qid] = [(batch_start_pos[qid], 0), (batch_start_pos[qid], 1)]
+                            current_pos[qid] = batch_start_pos[qid]
+                    batch_plans[micro_idx] = wait_only
+                    continue
+
                 T_pre = max(pre_in_arrival_times.values())
 
-                # PRE-IN-Wartepfade bis T_pre
+                # PRE-IN-Wartepfade bis T_pre (nur aktive Paare)
                 pre_in_wait_paths: Dict[int, List[TimedNode]] = {}
-                for a_id, b_id in pending_pairs_ids:
+                for a_id, b_id in active_pairs_ids:
                     pkey = frozenset({a_id, b_id})
                     meet = meeting_of_pair[pkey]
                     for qid in (a_id, b_id):
@@ -548,68 +610,60 @@ class RoutingPlanner:
                             raise RuntimeError("Fehler beim PRE-IN-Retiming.")
                         pre_in_wait_paths[qid] = cut
 
-                # -------- NEU: PRE-IN-Konflikte im Microbatch verhindern --------
-                # Map: qid -> PRE-IN-Knoten (aus den pre_in_wait_paths extrahieren)
+                # -------- PRE-IN-Konflikte im Microbatch verhindern (nur aktive Paare) --------
                 qid_pre_in: Dict[int, Coord] = {}
-                for a_id, b_id in pending_pairs_ids:
+                for a_id, b_id in active_pairs_ids:
                     pkey = frozenset({a_id, b_id})
                     meet = meeting_of_pair[pkey]
                     for qid in (a_id, b_id):
                         path_cut = pre_in_wait_paths[qid]
-                        # letzter Knoten in path_cut ist PRE-IN @ T_pre
                         qid_pre_in[qid] = path_cut[-1][0]
 
-                # Baue Konfliktgruppen: PRE-IN-Knoten -> Liste der Qubits, die dort @ T_pre stehen wollen
                 pre_in_groups: Dict[Coord, List[int]] = defaultdict(list)
                 for qid, pin in qid_pre_in.items():
                     pre_in_groups[pin].append(qid)
 
-                # Wähle pro PRE-IN höchstens EIN Paar (2 qids) aus; die restlichen Paare werden zurückgestellt
                 allowed_qids: Set[int] = set()
                 blocked_qids: Set[int] = set()
 
-                # Hilfsmap: qid -> zugehörige Paar-IDs (a_id,b_id)
                 qid_to_pair: Dict[int, Tuple[int, int]] = {}
-                for a_id, b_id in pending_pairs_ids:
+                for a_id, b_id in active_pairs_ids:
                     qid_to_pair[a_id] = (a_id, b_id)
                     qid_to_pair[b_id] = (a_id, b_id)
 
-                # Priorität: Reihenfolge in pending_pairs_ids beibehalten (stabil)
-                pair_priority = { (a,b): idx for idx, (a,b) in enumerate(pending_pairs_ids) }
+                pair_priority = {(a, b): idx for idx, (a, b) in enumerate(active_pairs_ids)}
 
                 for pre_in, qids in pre_in_groups.items():
                     if len(qids) == 1:
                         allowed_qids.add(qids[0])
                         continue
-
-                    # Mehrere Qubits wollen denselben PRE-IN: wähle das Paar mit höchster Priorität
-                    # und blocke die anderen Paare komplett.
                     cand_pairs = set(qid_to_pair[q] for q in qids)
                     winner_pair = min(cand_pairs, key=lambda p: pair_priority[p])
                     wa, wb = winner_pair
                     allowed_qids.update([wa, wb])
-
-                    # Alle Qubits aus anderen Paaren werden blockiert
                     for p in cand_pairs:
                         if p == winner_pair:
                             continue
                         ba, bb = p
                         blocked_qids.update([ba, bb])
 
-                # Falls ein Qubit weder explizit allowed noch blocked ist (kein Konflikt),
-                # erlaube es ganz normal:
-                for a_id, b_id in pending_pairs_ids:
+                for a_id, b_id in active_pairs_ids:
                     if a_id not in blocked_qids:
                         allowed_qids.add(a_id)
                     if b_id not in blocked_qids:
                         allowed_qids.add(b_id)
-                # ---------------------------------------------------------------
+
+                # zusätzlich: alle Paare, die in diesem Attempt NICHT aktiv waren, als "blocked" markieren (sichtbares Warten)
+                deferred_qids: Set[int] = set()
+                deferred_pairs = [p for p in pending_pairs_ids if p not in active_pairs_ids]
+                for a_id, b_id in deferred_pairs:
+                    deferred_qids.update([a_id, b_id])
+                blocked_qids |= deferred_qids
+                # ---------------------------------------------------------------------
 
                 # -------- Phase 2: Reset/Entry + Meeting-Sync --------
-                # Entscheidung pro Qubit (nur relevant für allowed_qids)
                 decided_success: Dict[int, bool] = {}
-                for a_id, b_id in pending_pairs_ids:
-                    # nur für Qubits, die noch nicht success sind
+                for a_id, b_id in active_pairs_ids:
                     if not success[a_id]:
                         decided_success[a_id] = (random.random() < p_success)
                     else:
@@ -622,36 +676,47 @@ class RoutingPlanner:
                 T_meet = T_pre + 1
                 micro_paths: Dict[int, List[TimedNode]] = {}
 
-                for a_id, b_id in pending_pairs_ids:
+                # 2a) Paths für aktive Paare + blockierte/deferred Qubits einsetzen
+                involved_qids_in_active: Set[int] = {q for (a, b) in active_pairs_ids for q in (a, b)}
+                all_pending_qids: Set[int] = {q for (a, b) in pending_pairs_ids for q in (a, b)}
+
+                # Zuerst: blockierte (inkl. deferred) warten sichtbar am Batch-Start
+                for qid in (all_pending_qids - involved_qids_in_active) | (blocked_qids - deferred_qids):
+                    base = [(batch_start_pos[qid], 0)]
+                    cur_t = 0
+                    while cur_t < T_pre:
+                        base.append((batch_start_pos[qid], cur_t + 1))
+                        cur_t += 1
+                    base.append((batch_start_pos[qid], T_pre + 1))
+                    micro_paths[qid] = base
+
+                # Dann: aktive, zugelassene Qubits – nur bei beidseitigem Erfolg in den IN
+                for a_id, b_id in active_pairs_ids:
                     pkey = frozenset({a_id, b_id})
                     meet = meeting_of_pair[pkey]
 
+                    pair_success_both = decided_success.get(a_id, False) and decided_success.get(b_id, False)
+
                     for qid in (a_id, b_id):
                         if qid in blocked_qids:
-                            # Dieses Qubit nimmt NICHT am Attempt teil:
-                            # Es bleibt bis T_pre am Batch-Start und springt (sichtbar) bei T_pre+1 wieder dorthin.
-                            base = [(batch_start_pos[qid], 0)]
-                            cur_t = 0
-                            while cur_t < T_pre:
-                                base.append((batch_start_pos[qid], cur_t + 1))
-                                cur_t += 1
-                            # Sichtbarer „Reset“-Schritt bei T_pre+1
-                            base.append((batch_start_pos[qid], T_pre + 1))
-                            micro_paths[qid] = base
                             continue
 
-                        # Normale Teilnahme (wie bisher)
-                        base = pre_in_wait_paths[qid].copy()   # endet bei PRE-IN @ T_pre
+                        base = pre_in_wait_paths[qid].copy()  # endet am PRE-IN @ T_pre
                         assert base[-1][1] == T_pre
+                        pre_in_node = base[-1][0]
 
-                        if decided_success[qid]:
-                            # Schritt PRE-IN -> Meeting bei T_pre+1
-                            base.append((meet, T_pre + 1))
+                        if decided_success.get(qid, False):
+                            if pair_success_both:
+                                # beide erfolgreich: gemeinsamer Schritt ins Meeting
+                                base.append((meet, T_pre + 1))
+                            else:
+                                # nur dieses Qubit erfolgreich: am PRE-IN bleiben (sichtbar warten)
+                                base.append((pre_in_node, T_pre + 1))
                         else:
-                            # Reset-Sprung zur Batch-Startposition bei T_pre+1
+                            # Reset fehlgeschlagen: zurück zum Batch-Start
                             base.append((batch_start_pos[qid], T_pre + 1))
 
-                        # Sync bis T_meet (ist bereits T_pre+1)
+                        # bis T_meet auffüllen (sichtbares Warten)
                         cur_t = base[-1][1]
                         while cur_t < T_meet:
                             base.append((base[-1][0], cur_t + 1))
@@ -659,52 +724,55 @@ class RoutingPlanner:
 
                         micro_paths[qid] = base
 
-                # Microbatch einsetzen
                 batch_plans[micro_idx] = micro_paths
 
                 # -------- Status-Update / Fixierung / Positionen --------
                 for a_id, b_id in pending_pairs_ids:
                     pkey = frozenset({a_id, b_id})
-                    meet = meeting_of_pair[pkey]
+                    meet = meeting_of_pair.get(pkey)  # kann None sein für deferred Paare
+
+                    if (a_id, b_id) not in active_pairs_ids:
+                        # Deferred: bleiben am Start
+                        current_pos[a_id] = batch_start_pos[a_id]
+                        current_pos[b_id] = batch_start_pos[b_id]
+                        continue
+
+                    # PRE-IN-Positionen aus den geschnittenen Pfaden
+                    a_pre_in = pre_in_wait_paths[a_id][-1][0] if a_id in pre_in_wait_paths else batch_start_pos[a_id]
+                    b_pre_in = pre_in_wait_paths[b_id][-1][0] if b_id in pre_in_wait_paths else batch_start_pos[b_id]
+
+                    pair_success_both = decided_success.get(a_id, False) and decided_success.get(b_id, False)
 
                     # a
                     if a_id in blocked_qids:
-                        # Nicht teilgenommen → bleibt am Batch-Start
                         current_pos[a_id] = batch_start_pos[a_id]
                     else:
-                        if not success[a_id]:
-                            if decided_success[a_id]:
-                                success[a_id] = True
-                                current_pos[a_id] = meet
-                            else:
-                                current_pos[a_id] = batch_start_pos[a_id]
+                        if decided_success.get(a_id, False):
+                            success[a_id] = True
+                            current_pos[a_id] = meet if (pair_success_both and meet is not None) else a_pre_in
                         else:
-                            current_pos[a_id] = meet  # bleibt beim Meeting (wartet)
+                            current_pos[a_id] = batch_start_pos[a_id]
 
                     # b
                     if b_id in blocked_qids:
                         current_pos[b_id] = batch_start_pos[b_id]
                     else:
-                        if not success[b_id]:
-                            if decided_success[b_id]:
-                                success[b_id] = True
-                                current_pos[b_id] = meet
-                            else:
-                                current_pos[b_id] = batch_start_pos[b_id]
+                        if decided_success.get(b_id, False):
+                            success[b_id] = True
+                            current_pos[b_id] = meet if (pair_success_both and meet is not None) else b_pre_in
                         else:
-                            current_pos[b_id] = meet
+                            current_pos[b_id] = batch_start_pos[b_id]
 
-                    # sobald mind. ein Qubit der Paarung erfolgreich war → Meeting fixieren
-                    if pkey not in fixed_meetings and ((a_id not in blocked_qids and decided_success[a_id]) or
-                                                    (b_id not in blocked_qids and decided_success[b_id]) or
-                                                    success[a_id] or success[b_id]):
-                        if success[a_id] or success[b_id]:
-                            fixed_meetings[pkey] = meet
+                    # Meeting fixieren, sobald mind. ein Qubit erfolgreich (wie zuvor)
+                    if meet is not None and (pkey not in fixed_meetings) and (success[a_id] or success[b_id]):
+                        fixed_meetings[pkey] = meet
 
             # nächster Batch
             i = j
 
         return RoutingPlanner.stitch_batches(qubits, batch_plans)
+
+
 
 
 
