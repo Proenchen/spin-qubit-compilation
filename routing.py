@@ -475,6 +475,7 @@ class RoutingPlanner:
                 attempt_full,
                 meeting_of_pair,
                 batch_plans,
+                p_success=p_success
             )
 
             # Falls Evakuierung nicht alle Blocker wegbekam:
@@ -1025,6 +1026,7 @@ class RoutingPlanner:
         attempt_full: Dict[int, List[TimedNode]],
         meeting_of_pair: Dict[frozenset, Coord],
         batch_plans: List[Dict[int, List[TimedNode]]],
+        p_success: float = P_SUCCESS
     ) -> Set[Coord]:
         """
         Bewegt NUR Non-Layer-Qubits, deren *aktuelle Position* Layer-Pfade/INs blockiert.
@@ -1071,24 +1073,60 @@ class RoutingPlanner:
         try:
             plans = RoutingPlanner._mapf_to_targets(G, starts, targets, blocked_nodes=blocked_nodes)
             if plans:
-                batch_plans.append(plans)
-                for qid, p in plans.items():
-                    current_pos[qid] = p[-1][0]
+                # Wir führen die Evakuierung probabilistisch in Microbatches aus.
+                # orig_starts: für den sichtbaren Reset bei Fehlschlag.
+                orig_starts = dict(starts)
+                pending: Set[int] = set(plans.keys())  # Qubits, die ihr Ziel noch nicht "stabil" erreicht haben
+
+                # Gleiche Kollisionsfreie Pfade pro Versuch wiederverwenden (einfach nochmal probieren).
+                while pending:
+                    micro: Dict[int, List[TimedNode]] = {}
+                    # Ausführung eines Versuchs (alle pending laufen gleichzeitig ihren geplanten Pfad)
+                    for qid in list(pending):
+                        path = plans[qid]  # beginnt bei t=0 und endet am Ziel
+                        succeeded = (random.random() < p_success)
+                        if succeeded:
+                            # Erfolgreich: zeige den kompletten Lauf bis zum Ziel
+                            micro[qid] = path
+                            current_pos[qid] = path[-1][0]
+                            pending.remove(qid)
+                        else:
+                            # Fehlgeschlagen: Lauf bis Ziel, dann *sofort* sichtbarer Reset (Teleport) zurück zum Start
+                            last_t = path[-1][1]
+                            back = (orig_starts[qid], last_t + 1)
+                            micro[qid] = path + [back]
+                            current_pos[qid] = orig_starts[qid]
+                            # bleibt in 'pending' und versucht es im nächsten Microbatch erneut
+
+                    batch_plans.append(micro)
         except RuntimeError:
             # Greedy agent-weise Evakuierung, jeweils mit aktueller Sperrmenge
             micro: Dict[int, List[TimedNode]] = {}
+            orig_starts_fallback: Dict[int, Coord] = {qid: current_pos[qid] for qid in targets}
+
             for qid, tgt in targets.items():
                 try:
                     one = RoutingPlanner._mapf_to_targets(
                         G, {qid: current_pos[qid]}, {qid: tgt}, blocked_nodes=blocked_nodes
                     )
-                    micro.update(one)
-                    current_pos[qid] = one[qid][-1][0]
-                    # blockiere erreichte Ziele für nachfolgende
-                    blocked_nodes = set(blocked_nodes) | {current_pos[qid]}
+                    # Probabilistisch ausführen: entweder ankommen oder sofortiger Reset zurück
+                    path = one[qid]
+                    succeeded = (random.random() < p_success)
+                    if succeeded:
+                        micro[qid] = path
+                        current_pos[qid] = path[-1][0]
+                        # erreichte Ziele blockieren
+                        blocked_nodes = set(blocked_nodes) | {current_pos[qid]}
+                    else:
+                        last_t = path[-1][1]
+                        back = (orig_starts_fallback[qid], last_t + 1)
+                        micro[qid] = path + [back]
+                        current_pos[qid] = orig_starts_fallback[qid]
+                        # nicht blockieren; er versucht es in einer späteren Evakuierung erneut
                 except RuntimeError:
-                    # Dieser Blocker bleibt zunächst stehen
+                    # Dieser Blocker bleibt zunächst stehen (keine Route), später erneut versuchen
                     pass
+
             if micro:
                 batch_plans.append(micro)
 
@@ -1123,6 +1161,48 @@ class RoutingPlanner:
                     return None
                 preins[qid] = pin
         return preins
+    
+    @staticmethod
+    def _retime_until_pre_in_wait(
+        path: List[TimedNode],
+        meeting: Coord,
+        sync_time: int,
+    ) -> Optional[List[TimedNode]]:
+        """
+        Schneidet 'path' so ab, dass er am PRE-IN endet und dort bis 'sync_time' wartet.
+        Gibt einen Pfad zurück, der mit PRE-IN @ sync_time endet (Meeting wird NICHT betreten).
+        """
+        if not path:
+            return None
+
+        # Index der ersten Ankunft am Meeting
+        first_meet_idx = None
+        for i, (c, _) in enumerate(path):
+            if c == meeting:
+                first_meet_idx = i
+                break
+        if first_meet_idx is None:
+            return None  # path endet nicht im meeting (sollte nicht passieren)
+
+        if first_meet_idx == 0:
+            # Start bereits im Meeting → PRE-IN existiert nicht; wir warten einfach im Start, bis sync_time
+            start_node, start_t = path[0]
+            new_path = [(start_node, start_t)]
+            cur_t = start_t
+            while cur_t < sync_time:
+                new_path.append((start_node, cur_t + 1))
+                cur_t += 1
+            return new_path
+
+        pre_in, t_pre_in = path[first_meet_idx - 1]
+        new_path = path[: first_meet_idx]  # endet am PRE-IN (Zeit t_pre_in)
+
+        # Warte am PRE-IN bis sync_time
+        cur_t = t_pre_in
+        while cur_t < sync_time:
+            new_path.append((pre_in, cur_t + 1))
+            cur_t += 1
+        return new_path
 
 
 
