@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from heapq import heappush, heappop
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Set
+from network import Qubit
 
 import networkx as nx
 import random
@@ -17,11 +18,6 @@ from utils.animation import animate_mapf
 # --------------------------
 Coord = Tuple[int, int]
 TimedNode = Tuple[Coord, int]
-
-@dataclass(frozen=True)
-class Qubit:
-    id: int
-    pos: Coord
 
 MAX_TIME = 300
 P_SUCCESS = 0.98
@@ -1621,10 +1617,16 @@ class RoutingPlanner:
         return RoutingPlanner.stitch_batches(qubits, batch_plans, batch_defects)
 
 if __name__ == "__main__":
-    G = NetworkBuilder.build_network(3,3)
+    G, qubits, pairs = NetworkBuilder.place_qubits_and_make_pairs(
+        width=3,
+        height=3,
+        n_qubits=6,
+        rounds=6,
+        seed=42,  # optional, für reproduzierbare Ergebnisse
+    )
     random.seed()
 
-    qubits: List[Qubit] = [
+    """ qubits: List[Qubit] = [
         Qubit(0, (1, -2)),
         Qubit(1, (1,  0)),
         Qubit(2, (-1, 0)),
@@ -1644,7 +1646,7 @@ if __name__ == "__main__":
         (qubits[0], qubits[5]),  #5
         (qubits[1], qubits[3]),  #5
         (qubits[4], qubits[5]),  #6
-    ]
+    ] """
 
     planner = RoutingPlanner()
     timelines, edge_timebands = planner.routing_with_reroute(G, qubits, pairs)
