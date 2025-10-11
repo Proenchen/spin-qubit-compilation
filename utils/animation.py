@@ -1,6 +1,8 @@
 from matplotlib.animation import FuncAnimation
 import networkx as nx
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+import math
 
 NODE_SIZE = 120
 
@@ -10,14 +12,12 @@ def _build_time_indexed_positions(path):
     holding position once agent stops moving.
     """
     if not path:
-        return {}
+        return {}, 0, 0
     t_min = path[0][1]
     t_max = path[-1][1]
     per_t = {}
-    # For each integer t in [t_min, t_max], assign the node occupied at that t
     i = 0
     for t in range(t_min, t_max + 1):
-        # advance along path while next entry's time <= t
         while i + 1 < len(path) and path[i + 1][1] <= t:
             i += 1
         per_t[t] = path[i][0]
@@ -34,9 +34,7 @@ def _make_smooth_positions(path, substeps=5):
     """
     if not path:
         return [], [], -1
-    # Ensure we have position for each integer t (hold at last)
     per_t, t0, t1 = _build_time_indexed_positions(path)
-    # Build fine-grained frames
     positions = []
     frames = []
     for t in range(t0, t1):
@@ -46,7 +44,6 @@ def _make_smooth_positions(path, substeps=5):
             alpha = s / float(substeps)
             positions.append(_interpolate(p0, p1, alpha))
             frames.append(t + alpha)
-    # include final exact position at t1
     positions.append(per_t[t1])
     frames.append(float(t1))
     return positions, frames, len(positions) - 1
@@ -62,28 +59,37 @@ def _make_step_positions(path):
     positions = [per_t[t] for t in frames]
     return positions, frames, len(positions) - 1
 
-def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=200):
+
+def animate_mapf(
+    G,
+    plans,
+    interval_ms=0.1,
+    smooth=True,
+    substeps=200,
+    edge_timebands=None,            # [(t_start, t_end, set(frozenset({u,v})))]  mit Halb-Offen: [t_start, t_end)
+    failed_edges_timeline=None,     # {t_int: set(frozenset({u,v}))}
+):
     pos = {n: n for n in G}
 
-    # constrained_layout=True kümmert sich um Platz für die Legende
     fig, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
 
-    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.3)
-    nx.draw_networkx_nodes(
-        G, pos, nodelist=[n for n, d in G.nodes(data=True) if d["type"] == "IN"],
-        node_shape="s", node_size=NODE_SIZE, ax=ax
-    )
-    nx.draw_networkx_nodes(
-        G, pos, nodelist=[n for n, d in G.nodes(data=True) if d["type"] == "SN"],
-        node_shape="o", node_size=NODE_SIZE, ax=ax
-    )
-    ax.set_aspect("equal")
-    ax.axis("off")
+    all_segments = [(pos[u], pos[v]) for u, v in G.edges()]
+    base_edges = LineCollection(all_segments, alpha=0.3, linewidths=1.0, zorder=1)
+    ax.add_collection(base_edges)
+
+    failed_lc = LineCollection([], colors="red", linewidths=2.2, alpha=0.9, zorder=3)
+    ax.add_collection(failed_lc)
+
+    in_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "IN"]
+    sn_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "SN"]
+    nx.draw_networkx_nodes(G, pos, nodelist=in_nodes, node_shape="s", node_size=NODE_SIZE, ax=ax)
+    nx.draw_networkx_nodes(G, pos, nodelist=sn_nodes, node_shape="o", node_size=NODE_SIZE, ax=ax)
+
+    ax.set_aspect("equal"); ax.axis("off")
 
     colors = ["tab:red","tab:green","tab:orange","tab:purple",
               "tab:brown","tab:pink","tab:gray","tab:olive","tab:cyan"]
 
-    # Agent-IDs numerisch sortieren
     def _qid_sort_key(aid):
         s = str(aid)
         return (0, int(s)) if s.lstrip("-").isdigit() else (1, s)
@@ -104,23 +110,20 @@ def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=200):
             "positions": positions,
             "frames": frames,
             "last_idx": last_idx,
+            "frame_to_pos": dict(zip(frames, positions)),
+            "first_frame": frames[0] if frames else None,
+            "last_frame": frames[-1] if frames else None,
         })
         global_frames.update(frames)
 
     global_frames = sorted(global_frames)
-
-    for data in agent_data:
-        frame_to_pos = dict(zip(data["frames"], data["positions"]))
-        data["frame_to_pos"] = frame_to_pos
-        data["first_frame"] = data["frames"][0] if data["frames"] else None
-        data["last_frame"]  = data["frames"][-1] if data["frames"] else None
 
     moving_artists = []
     legend_handles = []
     legend_labels = []
     for data in agent_data:
         col = data["color"]
-        p0 = data["positions"][0] if data["frames"] else (0, 0)
+        p0 = data["positions"][0] if data["positions"] else (0, 0)
         dot, = ax.plot([p0[0]], [p0[1]], marker="o", markersize=8,
                        markeredgecolor="black", markeredgewidth=1.2,
                        linestyle="None", color=col, alpha=0.95, zorder=4)
@@ -129,11 +132,7 @@ def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=200):
                                          markerfacecolor=col, markeredgecolor="black",
                                          markersize=8))
         legend_labels.append(f"Qubit {data['aid']}")
-
-    # Legende rechts außerhalb platzieren
-    ax.legend(legend_handles, legend_labels,
-              loc="center left", bbox_to_anchor=(1.00, 0.5),
-              frameon=True)
+    ax.legend(legend_handles, legend_labels, loc="center left", bbox_to_anchor=(1.00, 0.5), frameon=True)
 
     def get_agent_pos_for_frame(data, gf):
         if gf in data["frame_to_pos"]:
@@ -145,19 +144,43 @@ def animate_mapf(G, plans, interval_ms=0.01, smooth=True, substeps=200):
         prev = max([f for f in data["frames"] if f <= gf], default=data["frames"][0])
         return data["frame_to_pos"][prev]
 
+    def defects_for_time(gf):
+        """
+        Liefert defekte Kanten-Segmente für Frame gf.
+        - failed_edges_timeline: direkte, frame-genaue Zuordnung (Zeit = Integer)
+        - edge_timebands: HALB-OFFENE Intervalle [t0, t1) für eindeutige Zustandswechsel je Layer
+        """
+        if failed_edges_timeline is not None:
+            tf = int(math.floor(gf + 1e-9))  # deterministisch: vorwärts offene Frames landen im „früheren“ Integer
+            failed = failed_edges_timeline.get(tf, set())
+        elif edge_timebands is not None:
+            tf = int(math.floor(gf + 1e-9))
+            failed = set()
+            for (t0, t1, edges) in edge_timebands:
+                # Halb-offen: gilt für t0 <= tf < t1
+                if t0 <= tf < t1:
+                    failed |= set(edges)
+        else:
+            return []
+
+        segs = []
+        for e in failed:
+            u, v = tuple(e)
+            segs.append((pos[u], pos[v]))
+        return segs
+
     def update(frame_idx):
         gf = global_frames[frame_idx]
-        artists = []
+        failed_segments = defects_for_time(gf)
+        failed_lc.set_segments(failed_segments)
+
+        artists = [failed_lc]
         for i, data in enumerate(agent_data):
             x, y = get_agent_pos_for_frame(data, gf)
             moving_artists[i].set_data([x], [y])
             artists.append(moving_artists[i])
         return artists
 
-    anim = FuncAnimation(
-        fig, update, frames=len(global_frames), interval=interval_ms,
-        blit=True, repeat=True
-    )
-
+    anim = FuncAnimation(fig, update, frames=len(global_frames), interval=interval_ms, blit=True, repeat=True)
     plt.show()
     return anim
