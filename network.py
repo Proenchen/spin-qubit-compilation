@@ -1,30 +1,49 @@
 import networkx as nx
 
 class NetworkBuilder:
-    """Builds the 2x2 tiled 8-neighborhood graph with typed nodes (IN/SN)."""
+    """Builds tiled 8-neighborhood graphs with typed nodes (IN/SN)."""
 
     @staticmethod
-    def build_network() -> nx.Graph:
+    def build_network(width: int, height: int) -> nx.Graph:
         """
-        Create a 2x2 tiling of 8-node patterns (no center),
-        connect with 8-neighborhood edges. Node attribute 'typ' ∈ {'IN','SN'}.
+        Create a width x height tiling of the 8-node pattern (no center),
+        connected with 8-neighborhood edges. Node attribute 'type' ∈ {'IN','SN'}.
         Corners are 'IN'; others are 'SN'.
+
+        Coordinates follow the original convention:
+        - Each tile is offset by +2 in x for columns
+        - Each tile is offset by -2 in y for rows (so rows go downward)
+
+        Args:
+            width:  number of tiles horizontally (>=1)
+            height: number of tiles vertically (>=1)
+
+        Returns:
+            nx.Graph: The tiled network graph.
         """
+        if not (isinstance(width, int) and isinstance(height, int) and width >= 1 and height >= 1):
+            raise ValueError("width and height must be integers >= 1")
+
+        # Single-tile template (no center)
         template_pos = {
             0: (-1,  1), 1: (0, 1),  2: (1, 1),
             3: (-1,  0),             4: (1, 0),
             5: (-1, -1), 6: (0, -1), 7: (1, -1),
         }
         corners = {0, 2, 5, 7}
-        tile_offsets = [(0, 0), (2, 0), (0, -2), (2, -2)]  
 
         G = nx.Graph()
-        for dx, dy in tile_offsets:
-            for t_id, (x, y) in template_pos.items():
-                coord = (x + dx, y + dy)
-                if coord not in G:
-                    G.add_node(coord, type=("IN" if t_id in corners else "SN"))
 
+        # Place tiles in a width x height grid
+        for j in range(height):         # rows
+            for i in range(width):      # columns
+                dx, dy = 2 * i, -2 * j  # keep original spacing/orientation
+                for t_id, (x, y) in template_pos.items():
+                    coord = (x + dx, y + dy)
+                    if coord not in G:
+                        G.add_node(coord, type=("IN" if t_id in corners else "SN"))
+
+        # Connect 8-neighborhood across the entire tiled grid
         coords = list(G.nodes())
         coord_set = set(coords)
         for (x, y) in coords:
@@ -35,4 +54,5 @@ class NetworkBuilder:
                     v = (x + ddx, y + ddy)
                     if v in coord_set:
                         G.add_edge((x, y), v)
+
         return G

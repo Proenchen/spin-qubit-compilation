@@ -1621,7 +1621,7 @@ class RoutingPlanner:
         return RoutingPlanner.stitch_batches(qubits, batch_plans, batch_defects)
 
 if __name__ == "__main__":
-    G = NetworkBuilder.build_network()
+    G = NetworkBuilder.build_network(3,3)
     random.seed()
 
     qubits: List[Qubit] = [
