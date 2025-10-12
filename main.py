@@ -2,6 +2,7 @@ import random
 
 from routing.network import NetworkBuilder
 from routing.default_routing import DefaultRoutingPlanner
+from routing.routing_with_reroute import RoutingPlannerWithRerouting
 from utils.animation import animate_mapf
 
 if __name__ == "__main__":
@@ -36,6 +37,7 @@ if __name__ == "__main__":
         (qubits[4], qubits[5]),  #6
     ] """
 
-    planner = DefaultRoutingPlanner()
+    #planner = DefaultRoutingPlanner()
+    planner = RoutingPlannerWithRerouting()
     timelines, edge_timebands = planner.route(G, qubits, pairs)
     animate_mapf(G, timelines, edge_timebands=edge_timebands, smooth=True)

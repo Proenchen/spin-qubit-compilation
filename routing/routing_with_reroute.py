@@ -9,7 +9,7 @@ from routing.common import Coord, TimedNode, Qubit
 from routing.default_routing import DefaultRoutingPlanner, P_REPAIR, P_SUCCESS
 
 
-class DefaultRoutingPlannerWithRerouting(DefaultRoutingPlanner):
+class RoutingPlannerWithRerouting(DefaultRoutingPlanner):
 
     @staticmethod
     def _preins_from_paths_for_pairs(
