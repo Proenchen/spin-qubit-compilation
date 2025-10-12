@@ -1,15 +1,8 @@
 import random
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
-
 import networkx as nx
 
-Coord = Tuple[int, int]
-
-@dataclass(frozen=True)
-class Qubit:
-    id: int
-    pos: Coord
+from typing import List, Tuple, Optional
+from routing.common import Qubit
 
 
 class NetworkBuilder:
