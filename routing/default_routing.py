@@ -1,197 +1,32 @@
 from __future__ import annotations
-
-from copy import deepcopy 
 from typing import Dict, List, Optional, Tuple, Set
-
-import networkx as nx
+from copy import deepcopy
 import random
+import networkx as nx
 
 from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubit
 
 P_SUCCESS = 0.98
-P_REPAIR = 0.5
+P_REPAIR = 0.25
 
 
-class DefaultRoutingPlanner:
-    """Orchestrates meeting-node selection and MAPF for pairs with egress staging."""
+class LayerFirstRoutingPlanner:
+    """
+    Routing in Layern mit (1) Auswahl bester Meeting-INs rein nach Layer,
+    (2) gezielter Evakuierung blockierender Non-Layer, (3) Sampling persistenter
+    Kantenfehler, (4) deterministischer Ausführung (Non-Layer -> preIN -> kurzer IN-Hop),
+    (5) Spillover nur für betroffene Paare.
 
-    @staticmethod
-    def meeting_candidates(
-        G: nx.Graph,
-        q0: Coord,
-        q1: Coord,
-        reserved_meetings: Optional[Set[Coord]] = None,
-        occupied_nodes: Optional[Set[Coord]] = None
-    ) -> List[Coord]:
-        if reserved_meetings is None:
-            reserved_meetings = set()
-        if occupied_nodes is None:
-            occupied_nodes = set()
+    Wichtige Nebenbedingungen:
+      - Pro Layer: keine zwei Paare teilen sich denselben IN.
+      - Keine Pfadknoten dürfen Startknoten eines Layer-Qubits sein.
+      - Alle Layer-Qubits müssen unterschiedliche PRE-IN (SN) benutzen.
+      - Non-Layer werden (falls nötig) kollisionsfrei auf freie SNs evakuiert,
+        die von keinem Layer-Pfad belegt sind. Gelingt das für einen Blocker
+        nicht, wird nur das betroffene Paar in ein Spillover-Layer verschoben.
+    """
 
-        q0_bfs_dist = nx.single_source_shortest_path_length(G, q0)
-        q1_bfs_dist = nx.single_source_shortest_path_length(G, q1)
-        all_in_nodes = [
-            n for n in G
-            if G.nodes[n]["type"] == "IN"
-            and n in q0_bfs_dist and n in q1_bfs_dist
-        ]
-
-        sorted_candidates = sorted(
-            all_in_nodes,
-            key=lambda n: (max(q0_bfs_dist[n], q1_bfs_dist[n]),
-                           q0_bfs_dist[n] + q1_bfs_dist[n],
-                           abs(q0_bfs_dist[n] - q1_bfs_dist[n]),
-                           n)
-        )
-
-        return [c for c in sorted_candidates if c not in reserved_meetings and c not in occupied_nodes]
-
-
-    @staticmethod
-    def pairwise_mapf(
-        G: nx.Graph,
-        pairs: List[Tuple[Qubit, Qubit]],
-        fixed_meetings: Optional[Dict[frozenset, Coord]] = None,
-        occupied_nodes: Optional[Set[Coord]] = None,
-        blocked_edges: Optional[Set[frozenset]] = None,
-    ) -> Dict[int, List[TimedNode]]:
-        """
-        Plan a batch of pairs. If synchronization at the meeting node fails,
-        the algorithm automatically falls back to alternative meeting candidates.
-
-        Parameters:
-        - pairs: list of qubit pairs to be routed.
-        - fixed_meetings: {pair -> node} for pairs that already have a fixed meeting node.
-        - occupied_nodes: nodes that must not be chosen as meeting candidates in this attempt.
-
-        Returns:
-        - A plan mapping qubit_id -> path (list of (node, time) steps).
-        """
-        fixed_meetings = fixed_meetings or {}
-        occupied_nodes = occupied_nodes or set()
-
-        # 1) Determine ordering of pairs based on their best candidate meeting node
-        prelim_infos = []
-        tmp_reserved: Set[Coord] = set()  # temporary reserved meetings, only for ordering
-        for i, (qa, qb) in enumerate(pairs):
-            pair_key = frozenset({qa.id, qb.id})
-            if pair_key in fixed_meetings:
-                m0 = fixed_meetings[pair_key]
-            else:
-                # best candidate list based on current start positions (avoid forbidden nodes)
-                cands = DefaultRoutingPlanner.meeting_candidates(G, qa.pos, qb.pos, tmp_reserved, occupied_nodes)
-                if not cands:
-                    raise RuntimeError(f"No meeting candidates available for pair {qa.id}-{qb.id}")
-                m0 = cands[0]
-
-            # Distances to best candidate (for ranking)
-            da = nx.single_source_shortest_path_length(G, qa.pos)
-            db = nx.single_source_shortest_path_length(G, qb.pos)
-            prelim_infos.append({
-                "pair_id": i,
-                "qa": qa,
-                "qb": qb,
-                "best_m": m0,
-                "maxd": max(da[m0], db[m0]),   # maximum distance
-                "sumd": da[m0] + db[m0],      # sum of distances
-            })
-            # Reserve this node temporarily for ordering purposes
-            tmp_reserved.add(m0)
-
-        # Sort pairs so the hardest ones (largest distance) are planned first
-        plan_order = sorted(prelim_infos, key=lambda p: (p["maxd"], p["sumd"]), reverse=True)
-
-        # 2) Actual planning with reservations
-        res = Reservations(G, blocked_edges=blocked_edges or set())
-
-        moving_starts: Set[Coord] = set()
-        for qa, qb in pairs:
-            moving_starts.add(qa.pos)
-            moving_starts.add(qb.pos)
-
-        # Nodes occupied at t=0 by qubits outside this attempt
-        static_nodes: Set[Coord] = set(occupied_nodes) - moving_starts
-
-        # For the duration of this attempt, treat those nodes as unavailable.
-        # We fully block capacity to avoid sharing with static agents.
-        for node in static_nodes:
-            cap = res.node_capacity(node)
-            # Reserve across the full search horizon so A* never steps on them.
-            for t in range(0, MAX_TIME + 1):
-                res.node_caps[node][t] = min(res.node_caps[node][t] + 1, cap)
-
-        plans: Dict[int, List[TimedNode]] = {}
-        reserved_meetings: Set[Coord] = set()  # permanently reserved meeting nodes
-
-        for item in plan_order:
-            qa: Qubit = item["qa"]
-            qb: Qubit = item["qb"]
-            pair_key = frozenset({qa.id, qb.id})
-
-            # Candidate list for this pair
-            if pair_key in fixed_meetings:
-                candidates = [fixed_meetings[pair_key]]  # force fixed meeting node
-            else:
-                candidates = DefaultRoutingPlanner.meeting_candidates(
-                    G, qa.pos, qb.pos, reserved_meetings, occupied_nodes
-                )
-
-            if not candidates:
-                raise RuntimeError(f"No meeting candidates left for pair {qa.id}-{qb.id}")
-
-            placed = False
-            for meeting in candidates:
-                # (a) Suche beider Pfade, aber committe noch nicht endgültig in 'res'
-                res_base = deepcopy(res)
-
-                # A zuerst, damit B Kollisionen mit A meidet
-                res_for_b = deepcopy(res_base)
-                a_plan = AStar.search(G, qa.pos, meeting, res_for_b)
-                if a_plan is None:
-                    continue
-                # "soft commit" nur in res_for_b, damit B darauf Rücksicht nimmt
-                Reservations.commit(res_for_b, a_plan)  # nutzt staticmethod? -> siehe unten
-                # Falls Reservations.commit nicht static ist, ersetze mit:
-                # for node in [a_plan[0]] + [p for p in a_plan[1:]]:
-                #   (wir brauchen hier wirklich commit; einfacher: Hilfsres wie unten)
-
-                b_plan = AStar.search(G, qb.pos, meeting, res_for_b)
-                if b_plan is None:
-                    continue
-
-                # (b) Synchronisation: früher Ankommende warten am PRE-IN, nicht im IN
-                Ta, Tb = a_plan[-1][1], b_plan[-1][1]
-                Tm = max(Ta, Tb)
-
-                a_plan2 = DefaultRoutingPlanner._retime_to_pre_in_wait(a_plan, meeting, Tm)
-                if a_plan2 is None:
-                    continue
-                b_plan2 = DefaultRoutingPlanner._retime_to_pre_in_wait(b_plan, meeting, Tm)
-                if b_plan2 is None:
-                    continue
-
-                # (c) Validieren & endgültig committen gegen die aktuelle globale 'res'
-                res_commit = deepcopy(res)
-                if not DefaultRoutingPlanner._try_commit(res_commit, a_plan2):
-                    continue
-                if not DefaultRoutingPlanner._try_commit(res_commit, b_plan2):
-                    continue
-
-                # (d) Erfolg: übernehme commit, reserviere Meeting, speichere Pläne
-                res = res_commit
-                reserved_meetings.add(meeting)
-                plans[qa.id] = a_plan2
-                plans[qb.id] = b_plan2
-                placed = True
-                break
-
-
-            if not placed:
-                raise RuntimeError(f"No feasible meeting (with sync) for pair {qa.id}-{qb.id}")
-
-        return plans
-
-    
+    # ---------- Öffentliche Hauptfunktion ----------
     @staticmethod
     def route(
         G: nx.Graph,
@@ -200,487 +35,596 @@ class DefaultRoutingPlanner:
         p_success: float = P_SUCCESS,
         p_repair: float = P_REPAIR,
     ):
-        """
-        Layer-basiertes Routing mit persistentem Kanten-Fehlermodell.
-
-        Änderungen ggü. vorher:
-        - Vor der Ausführung jedes Layers wird über alle Kanten gesampelt:
-            * jede intakte Kante wird mit W'keit (1 - p_success) defekt
-            * jede defekte Kante wird mit W'keit p_repair repariert
-            Defekte Kanten bleiben über Layer hinweg gesperrt.
-        - Pfadfindung (MAPF/A*) meidet defekte Kanten.
-        - Nach dem Sampling werden bereits geplante Pfade geprüft; unbenutzbare Paare
-            wandern in ein Spillover-Layer direkt hinter das aktuelle Layer.
-        - Qubit-Bewegungen selbst sind deterministisch erfolgreich (kein Schritt-Sampling).
-        - Für die Animation wird zusätzlich eine Zeitband-Liste der defekten Kanten erzeugt,
-            sodass defekte Kanten in den entsprechenden Zeitfenstern rot dargestellt werden.
-
-        Rückgabe:
-        timelines, edge_timebands
-            timelines: Dict[qid, List[(coord, t)]]
-            edge_timebands: List[(t_start, t_end, Set[frozenset({u,v})])]
-        """
-
-        # ---- Zustand / Hilfsstrukturen ----
+        # Zustand
         current_pos: Dict[int, Coord] = {q.id: q.pos for q in qubits}
-        qids_all: Set[int] = {q.id for q in qubits}
+        all_qids: Set[int] = {q.id for q in qubits}
 
-        # Persistenter Zustand defekter Kanten über alle Layer
-        defective_edges: Set[frozenset] = set()
-
-        # Wir sammeln Microbatches (sichtbare Teil-„Episoden“) und für jeden Batch
-        # einen Snapshot der defekten Kanten (für die rote Overlay-Animation).
+        defective_edges: Set[frozenset] = set()  # persistent über alle Layer
         batch_plans: List[Dict[int, List[TimedNode]]] = []
         batch_defects: List[Set[frozenset]] = []
 
-        def add_defect_snapshots(n_new_batches: int):
-            """Fügt für die letzten n_new_batches jeweils den aktuellen Defekt-Snapshot hinzu."""
-            for _ in range(n_new_batches):
+        # --- Persistente Buchhaltung: probierte Meeting-INs pro Paar ---
+        total_ins: Set[Coord] = {n for n in G if G.nodes[n].get("type") == "IN"}
+        tried_meetings: Dict[frozenset, Set[Coord]] = {}
+
+        def mark_meeting_failed(pair: Tuple[int, int], meet: Coord):
+            key = frozenset(pair)
+            s = tried_meetings.setdefault(key, set())
+            s.add(meet)
+            # Optionales Debug:
+            print(
+                f"[route] Markiere Meeting-IN {meet} als gescheitert für Paar {tuple(sorted(pair))} "
+                f"({len(s)}/{len(total_ins)} versucht)"
+            )
+
+        def snapshot_defects(n: int):
+            for _ in range(n):
                 batch_defects.append(set(defective_edges))
 
-        # Schnelle Map auf Qubit-Objekt in aktueller Position
-        def qobj(qid: int) -> Qubit:
-            return Qubit(qid, current_pos[qid])
-
-        # ---------- Layerbildung (greedy, disjunkt) ----------
+        # ---------- Layerbildung identisch zu Default ----------
         layers: List[List[Tuple[int, int]]] = []
         used: Set[int] = set()
-        cur_layer: List[Tuple[int, int]] = []
+        cur: List[Tuple[int, int]] = []
         for qa, qb in pairs:
             a, b = qa.id, qb.id
             if a not in used and b not in used:
-                cur_layer.append((a, b))
-                used.add(a); used.add(b)
+                cur.append((a, b))
+                used |= {a, b}
             else:
-                if cur_layer:
-                    layers.append(cur_layer)
-                cur_layer = [(a, b)]
+                if cur:
+                    layers.append(cur)
+                cur = [(a, b)]
                 used = {a, b}
-        if cur_layer:
-            layers.append(cur_layer)
+        if cur:
+            layers.append(cur)
 
-        # ---------- Hilfsfunktion: eindeutige INs + Pfade für Paare dieses Layers ----------
-        def plan_layer_candidates(
-            layer_pairs: List[Tuple[int, int]],
-        ) -> Tuple[Dict[int, List[TimedNode]], Dict[frozenset, Coord], List[Tuple[int, int]]]:
-            """
-            Plant so viele Paare wie möglich im aktuellen Layer mit:
-            - eindeutigen INs pro Paar
-            - eindeutigen PRE-INs (SN) für alle Layer-Qubits
-            Ein Paar kommt in 'spill_pairs', wenn keiner seiner Meeting-Kandidaten funktioniert.
-            Achtung: Verwendet *aktuell bekannte* defekte Kanten und meidet diese bereits in der Planung.
-            """
-            attempt_full: Dict[int, List[TimedNode]] = {}
-            meeting_of_pair: Dict[frozenset, Coord] = {}
-            spill_pairs: List[Tuple[int, int]] = []
-
-            layer_start_nodes: Set[Coord] = {current_pos[a] for a, _ in layer_pairs} | {current_pos[b] for _, b in layer_pairs}
-            occupied_now: Set[Coord] = {current_pos[q] for q in qids_all}
-            reserved_in_nodes: Set[Coord] = set()
-
-            # Heuristische Reihenfolge: wenige Kandidaten zuerst, dann größere maxd
-            pair_infos = []
-            for a_id, b_id in layer_pairs:
-                qa_now, qb_now = qobj(a_id), qobj(b_id)
-                cands = DefaultRoutingPlanner.meeting_candidates(
-                    G,
-                    qa_now.pos, qb_now.pos,
-                    reserved_meetings=reserved_in_nodes,
-                    occupied_nodes=(occupied_now | (layer_start_nodes - {qa_now.pos, qb_now.pos})),
-                )
-                # Distanzen (nur Heuristik)
-                da = nx.single_source_shortest_path_length(G, qa_now.pos)
-                db = nx.single_source_shortest_path_length(G, qb_now.pos)
-                maxd = min((max(da[n], db[n]) for n in cands), default=10**9)
-                pair_infos.append((a_id, b_id, len(cands), maxd, cands))
-
-            pair_infos.sort(key=lambda x: (x[2], -x[3]))
-
-            active_pairs: List[Tuple[int, int]] = []
-            active_fixed_meetings: Dict[frozenset, Coord] = {}
-            active_plans: Dict[int, List[TimedNode]] = {}
-
-            for a_id, b_id, _, _, _ in pair_infos:
-                qa_now, qb_now = qobj(a_id), qobj(b_id)
-
-                placed = False
-                # Kandidaten dynamisch neu berechnen (wegen inzwischen reservierter INs)
-                cands = DefaultRoutingPlanner.meeting_candidates(
-                    G,
-                    qa_now.pos, qb_now.pos,
-                    reserved_meetings=set(active_fixed_meetings.values()),
-                    occupied_nodes=(occupied_now | (layer_start_nodes - {qa_now.pos, qb_now.pos})),
-                )
-
-                for mnode in cands:
-                    try_pairs = active_pairs + [(a_id, b_id)]
-                    try_objs = [(qobj(x), qobj(y)) for (x, y) in try_pairs]
-                    try_fixed = dict(active_fixed_meetings)
-                    try_fixed[frozenset({a_id, b_id})] = mnode
-
-                    allowed = {current_pos[x] for (x, _) in try_pairs} | {current_pos[y] for (_, y) in try_pairs}
-                    hard_blocked = (layer_start_nodes - allowed)
-
-                    try:
-                        tmp_plans = DefaultRoutingPlanner.pairwise_mapf(
-                            G,
-                            try_objs,
-                            fixed_meetings=try_fixed,
-                            occupied_nodes=occupied_now | hard_blocked,
-                            blocked_edges=defective_edges,  # <— defekte Kanten strikt meiden
-                        )
-                    except RuntimeError:
-                        continue
-
-                    # PRE-INs bestimmen und eindeutige PRE-INs fordern
-                    preins_map = DefaultRoutingPlanner._preins_for_plans(tmp_plans, try_fixed)
-                    if preins_map is None:
-                        continue
-                    if len(set(preins_map.values())) != len(preins_map):
-                        continue
-
-                    # akzeptieren
-                    active_pairs = try_pairs
-                    active_fixed_meetings = try_fixed
-                    active_plans = tmp_plans
-                    reserved_in_nodes.add(mnode)
-                    placed = True
-                    break
-
-                if not placed:
-                    spill_pairs.append((a_id, b_id))
-
-            attempt_full = active_plans
-            meeting_of_pair = {frozenset({a, b}): active_fixed_meetings[frozenset({a, b})] for (a, b) in active_pairs}
-            return attempt_full, meeting_of_pair, spill_pairs
-
-        # ---------- Haupt-Loop über Layer inkl. Spillover ----------
+        # ---------- Hauptschleife ----------
         idx = 0
         while idx < len(layers):
             layer_pairs = layers[idx]
+            layer_qids: Set[int] = {x for ab in layer_pairs for x in ab}
+            non_layer_qids: Set[int] = all_qids - layer_qids
+            layer_starts: Set[Coord] = {current_pos[q] for q in layer_qids}
+            occupied_now: Set[Coord] = {current_pos[q] for q in all_qids}
 
-            # 1) Kandidaten & Pfade (bis Meeting) ... (dein bestehender Code)
-            attempt_full, meeting_of_pair, spill_pairs = plan_layer_candidates(layer_pairs)
+            replan_current_layer = False  # ★ falls wir im selben Layer neu planen wollen
 
-            # NEU: Paare, die in diesem Layer nicht platzierbar waren, in ein Spillover-Layer schieben
-            if spill_pairs:
-                layers[idx+1:idx+1] = [spill_pairs]
-
-
-            # 1a) Blocker räumen (Nicht-Layer-Qubits auf Layer-Pfad-/IN-Knoten)
-            #     Diese Funktion sollte intern _mapf_to_targets mit blocked_edges=defective_edges verwenden.
-            prev_batches = len(batch_plans)
-            remaining_block_coords = DefaultRoutingPlanner._evacuate_blocking_non_layer(
-                G, qubits, current_pos,
-                layer_pairs,
-                attempt_full,
-                meeting_of_pair,
-                batch_plans
+            # ===== Schritt 1: Nur Layer planen (beste INs, keine Non-Layer beachten) =====
+            (
+                to_meeting_plans,          # qid -> Pfad bis MEETING (mit Kollisionvermeidung)
+                fixed_meetings,            # pair_key -> meeting IN
+                preins_ok,                 # True/False, ob PRE-INs schon eindeutig
+                unplaceable_pairs_step1,   # Paare, die trotz Durchprobieren aller Kandidaten nicht platzbar sind
+                exhausted_pairs_step1,     # ★ Paare, für die *alle* INs schon global verboten wurden
+            ) = LayerFirstRoutingPlanner._plan_layer_only(
+                G=G,
+                current_pos=current_pos,
+                layer_pairs=layer_pairs,
+                layer_starts=layer_starts,
+                defective_edges=defective_edges,
+                banned_meetings=tried_meetings,   # ★ verbotene/gescheiterte INs berücksichtigen
+                all_ins=total_ins,
             )
-            # Für alle während der Evakuierung erzeugten Microbatches den Defektzustand mitloggen
-            add_defect_snapshots(len(batch_plans) - prev_batches)
 
-            # Blocker nicht vollständig räumbar → betroffene Paare in Spillover-Layer verschieben
-            if remaining_block_coords:
-                def path_nodes_of_pair(a_id: int, b_id: int) -> Set[Coord]:
-                    return {c for (c, _) in attempt_full.get(a_id, [])} | \
-                        {c for (c, _) in attempt_full.get(b_id, [])}
+            # ★ statt RuntimeError: Paare mit erschöpften IN-Möglichkeiten in Spillover
+            if exhausted_pairs_step1:
+                layers[idx+1:idx+1] = [exhausted_pairs_step1]
 
-                newly_spilled: List[Tuple[int, int]] = []
-                for (a_id, b_id) in layer_pairs:
-                    pkey = frozenset({a_id, b_id})
-                    if pkey not in meeting_of_pair:
-                        continue
-                    pn = path_nodes_of_pair(a_id, b_id)
-                    if pn & remaining_block_coords:
-                        newly_spilled.append((a_id, b_id))
-                        attempt_full.pop(a_id, None)
-                        attempt_full.pop(b_id, None)
-                        meeting_of_pair.pop(pkey, None)
+            LayerFirstRoutingPlanner._debug_print_meetings(idx, fixed_meetings, header="-- Nach _plan_layer_only --")
 
-                if newly_spilled:
-                    layers[idx+1:idx+1] = [newly_spilled]
+            # Paare aus Schritt 1 nicht planbar → Spillover (wir haben alle Kandidaten versucht)
+            if unplaceable_pairs_step1:
+                layers[idx+1:idx+1] = [unplaceable_pairs_step1]
+                if not fixed_meetings:
+                    wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
+                    batch_plans.append(wait)
+                    snapshot_defects(1)
+                    idx += 1
+                    continue
 
-            # Wenn kein Paar mehr in diesem Layer übrig ist → sichtbarer Wartebatch
-            if not any(frozenset({a, b}) in meeting_of_pair for (a, b) in layer_pairs):
-                wait_batch: Dict[int, List[TimedNode]] = {}
-                for q in qubits:
-                    qid = q.id
-                    wait_batch[qid] = [(current_pos[qid], 0), (current_pos[qid], 1)]
-                batch_plans.append(wait_batch)
-                add_defect_snapshots(1)
+            if not fixed_meetings:
+                wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
+                batch_plans.append(wait)
+                snapshot_defects(1)
                 idx += 1
                 continue
 
-            # 1b) PRE-IN schneiden (noch vor Sampling, aber Pfadfindung hat defekte Kanten bereits gemieden)
+            # Menge der vom Layer genutzten Knoten (für Evakuierungs-Sperren)
+            F_layer: Set[Coord] = LayerFirstRoutingPlanner._collect_layer_nodes(to_meeting_plans, fixed_meetings)
+            F_all = set(F_layer) | set(layer_starts)
+
+            # ===== Schritt 2: Blockierende Non-Layer evakuieren (nur falls nötig) =====
+            blockers_now: List[int] = [
+                qid for qid in non_layer_qids if current_pos[qid] in F_all
+            ]
+
+            blocker_to_pair: Dict[int, Tuple[int, int]] = {}
+            evac_plans: Dict[int, List[TimedNode]] = {}
+
+            if blockers_now:
+                # Zuordnung Blocker -> Paar
+                node_to_pairs: Dict[Coord, List[Tuple[int, int]]] = {}
+                pair_path_nodes: Dict[Tuple[int, int], Set[Coord]] = {}
+                for (a, b) in layer_pairs:
+                    key = frozenset({a, b})
+                    if key not in fixed_meetings:
+                        continue
+                    nodes = LayerFirstRoutingPlanner._path_nodes_of_pair(to_meeting_plans, a, b)
+                    pair_path_nodes[(a, b)] = nodes
+                    for n in nodes:
+                        node_to_pairs.setdefault(n, []).append((a, b))
+
+                for qid in blockers_now:
+                    pos = current_pos[qid]
+                    pairs_touching = node_to_pairs.get(pos, [])
+                    if pairs_touching:
+                        blocker_to_pair[qid] = pairs_touching[0]
+
+                # Ziele für Blocker: freie SN, die NICHT in F_layer liegen
+                avoid_for_targets = set(occupied_now) | F_all
+                targets: Dict[int, Coord] = {}
+                for qid in blockers_now:
+                    tgt = LayerFirstRoutingPlanner._nearest_free_sn(G, current_pos[qid], avoid_for_targets)
+                    if tgt is not None and tgt not in F_layer:
+                        targets[qid] = tgt
+                        avoid_for_targets.add(tgt)
+
+                # Wer keinen Ziel-SN findet → bisher Spillover, jetzt stattdessen IN verbieten & replan
+                cannot_place = [qid for qid in blockers_now if qid not in targets]
+                newly_affected: List[Tuple[int, int]] = []
+                for qid in cannot_place:
+                    if qid in blocker_to_pair:
+                        ab = blocker_to_pair[qid]
+                        newly_affected.append(ab)
+
+                if newly_affected:
+                    unique_pairs: List[Tuple[int, int]] = []
+                    seen_pairs: Set[frozenset] = set()
+                    for ab in newly_affected:
+                        pkey = frozenset(ab)
+                        if pkey in seen_pairs:
+                            continue
+                        seen_pairs.add(pkey)
+                        unique_pairs.append(ab)
+                        meet = fixed_meetings.get(pkey)
+                        if meet is not None:
+                            mark_meeting_failed(ab, meet)  # ★ nur dieses IN verbieten
+                        to_meeting_plans.pop(ab[0], None)
+                        to_meeting_plans.pop(ab[1], None)
+                        fixed_meetings.pop(pkey, None)
+                    replan_current_layer = True  # ★ anderes IN im gleichen Layer probieren
+
+                # Evakuierung für die restlichen Blocker planen
+                evacuating = {qid: current_pos[qid] for qid in blockers_now if qid in targets}
+                if evacuating:
+                    try:
+                        evac_plans = LayerFirstRoutingPlanner._mapf_to_targets(
+                            G=G,
+                            starts=evacuating,
+                            targets={qid: targets[qid] for qid in evacuating},
+                            blocked_nodes=F_all,                    # niemals Layer-Knoten betreten
+                            blocked_edges=defective_edges,          # aktuelle Defekte vermeiden
+                        )
+                    except RuntimeError:
+                        # Fallback agent-weise
+                        evac_plans = {}
+                        blocked_now = set(F_all)
+                        for qid in evacuating:
+                            try:
+                                one = LayerFirstRoutingPlanner._mapf_to_targets(
+                                    G=G,
+                                    starts={qid: current_pos[qid]},
+                                    targets={qid: targets[qid]},
+                                    blocked_nodes=blocked_now,
+                                    blocked_edges=defective_edges,
+                                )
+                                evac_plans[qid] = one[qid]
+                                blocked_now.add(one[qid][-1][0])
+                            except RuntimeError:
+                                ab = blocker_to_pair.get(qid)
+                                if ab:
+                                    pkey = frozenset(ab)
+                                    meet = fixed_meetings.get(pkey)
+                                    if meet is not None:
+                                        mark_meeting_failed(ab, meet)  # ★ nur IN verbieten
+                                    to_meeting_plans.pop(ab[0], None)
+                                    to_meeting_plans.pop(ab[1], None)
+                                    fixed_meetings.pop(pkey, None)
+                                    replan_current_layer = True  # ★ anderes IN probieren
+
+                # === Kollisionen mit wartenden Non-Layer auflösen (Handover-Regel) ===
+                if evac_plans:
+                    waiting_qids = (non_layer_qids - set(evacuating.keys()))
+                    evac_plans = LayerFirstRoutingPlanner._resolve_evacuate_collisions_with_waiters(
+                        G=G,
+                        evac_plans=evac_plans,
+                        targets={qid: targets[qid] for qid in evacuating},  # Ziele der bewegenden Non-Layer
+                        current_pos=current_pos,
+                        waiting_qids=waiting_qids,
+                        blocked_nodes=F_all,               # Layer-Knoten tabu
+                        defective_edges=defective_edges,   # respektiere Defekte
+                    )
+
+            # ★ Falls wir neu planen wollen: springe zum Schleifenanfang (gleiches Layer, neue IN-Wahl)
+            if replan_current_layer:
+                continue
+
+            if not fixed_meetings:
+                wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
+                batch_plans.append(wait)
+                snapshot_defects(1)
+                idx += 1
+                continue
+
+            # ===== Schritt 3: Sampling defekter Kanten und Validierung =====
+            LayerFirstRoutingPlanner._sample_edge_failures(
+                G, defective_edges, p_fail=(1.0 - p_success), p_repair=p_repair
+            )
+
+            # Prüfe Non-Layer-Evakuierungspfade: Defekt → betroff. Paar in Spillover (Ausnahme-Fall)
+            if evac_plans:
+                to_spill_for_nonlayer: Set[Tuple[int, int]] = set()
+                for qid, path in evac_plans.items():
+                    if LayerFirstRoutingPlanner._path_uses_defective_edge(path, defective_edges):
+                        ab = blocker_to_pair.get(qid)
+                        if ab:
+                            to_spill_for_nonlayer.add(ab)
+                if to_spill_for_nonlayer:
+                    # ★ Echte Defekte -> direkt Spillover
+                    for (a, b) in to_spill_for_nonlayer:
+                        key = frozenset({a, b})
+                        meet = fixed_meetings.get(key)
+                        if meet is not None:
+                            mark_meeting_failed((a, b), meet)
+                        to_meeting_plans.pop(a, None)
+                        to_meeting_plans.pop(b, None)
+                        fixed_meetings.pop(key, None)
+                    layers[idx+1:idx+1] = [list(to_spill_for_nonlayer)]
+
+            if not fixed_meetings:
+                wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
+                batch_plans.append(wait)
+                snapshot_defects(1)
+                idx += 1
+                continue
+
+            # preIN-Pfade schneiden und Defekte prüfen (inkl. Kurz-Hop-Kanten)
             pre_in_paths: Dict[int, List[TimedNode]] = {}
-            for (a_id, b_id) in layer_pairs:
-                pkey = frozenset({a_id, b_id})
-                if pkey not in meeting_of_pair:
+            T_pre_sync = 0
+            for (a, b) in layer_pairs:
+                key = frozenset({a, b})
+                if key not in fixed_meetings:
                     continue
-                meet = meeting_of_pair[pkey]
-                for qid in (a_id, b_id):
-                    cut = DefaultRoutingPlanner._retime_until_pre_in_wait(attempt_full[qid], meet, 0)
+                meet = fixed_meetings[key]
+                for qid in (a, b):
+                    cut = LayerFirstRoutingPlanner._retime_until_pre_in_wait(
+                        to_meeting_plans[qid], meet, 0
+                    )
                     if cut is None:
-                        # sollte selten sein → ab ins Spillover
-                        attempt_full.pop(a_id, None)
-                        attempt_full.pop(b_id, None)
-                        meeting_of_pair.pop(pkey, None)
+                        # ★ kein Defekt → anderes IN probieren (nicht Spillover)
+                        meet2 = fixed_meetings.get(key)
+                        if meet2 is not None:
+                            mark_meeting_failed((a, b), meet2)
+                        to_meeting_plans.pop(a, None)
+                        to_meeting_plans.pop(b, None)
+                        fixed_meetings.pop(key, None)
+                        replan_current_layer = True
                         break
                     pre_in_paths[qid] = cut
+                    if cut:
+                        T_pre_sync = max(T_pre_sync, cut[-1][1])
 
-            # Falls durch das Schneiden alles weggefallen ist
-            if not pre_in_paths:
-                wait_batch: Dict[int, List[TimedNode]] = {}
-                for q in qubits:
-                    qid = q.id
-                    wait_batch[qid] = [(current_pos[qid], 0), (current_pos[qid], 1)]
-                batch_plans.append(wait_batch)
-                add_defect_snapshots(1)
+            # ★ bei Replan zurück zum Layer-Anfang
+            if replan_current_layer:
+                continue
+
+            if not fixed_meetings:
+                wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
+                batch_plans.append(wait)
+                snapshot_defects(1)
                 idx += 1
                 continue
 
-            # --- NEU: Kanten-Fehlermodell anwenden (P_fail=1-p_success, P_repair)
-            DefaultRoutingPlanner._sample_edge_failures(
-                G,
-                defective_edges,
-                p_fail=(1.0 - p_success),
-                p_repair=p_repair,
-            )
-
-            # Nach dem Sampling prüfen, ob PRE-IN-Pfade + IN-Hop noch gültig sind; sonst in Spillover
-            def pair_invalid(a_id: int, b_id: int, meet: Coord) -> bool:
-                pa = pre_in_paths.get(a_id)
-                pb = pre_in_paths.get(b_id)
+            # Defekte auf Layer-PreIN-Pfaden oder den Hop-Kanten?
+            to_spill_layer_defects: List[Tuple[int, int]] = []
+            for (a, b) in layer_pairs:
+                key = frozenset({a, b})
+                if key not in fixed_meetings:
+                    continue
+                meet = fixed_meetings[key]
+                pa = pre_in_paths.get(a)
+                pb = pre_in_paths.get(b)
                 if pa is None or pb is None:
-                    return True
-                if DefaultRoutingPlanner._path_uses_defective_edge(pa, defective_edges):
-                    return True
-                if DefaultRoutingPlanner._path_uses_defective_edge(pb, defective_edges):
-                    return True
+                    # Hier landen wir nicht mehr (würden oben replannen), lassen aber konservativ drin
+                    to_spill_layer_defects.append((a, b))
+                    continue
+                if LayerFirstRoutingPlanner._path_uses_defective_edge(pa, defective_edges):
+                    to_spill_layer_defects.append((a, b))
+                    continue
+                if LayerFirstRoutingPlanner._path_uses_defective_edge(pb, defective_edges):
+                    to_spill_layer_defects.append((a, b))
+                    continue
                 pre_a = pa[-1][0]
                 pre_b = pb[-1][0]
-                hop_edges = {frozenset({pre_a, meet}), frozenset({pre_b, meet})}
-                return any(e in defective_edges for e in hop_edges)
+                if (frozenset({pre_a, meet}) in defective_edges) or (frozenset({pre_b, meet}) in defective_edges):
+                    to_spill_layer_defects.append((a, b))
 
-            newly_spilled_after_sampling: List[Tuple[int, int]] = []
-            for (a_id, b_id) in layer_pairs:
-                pkey = frozenset({a_id, b_id})
-                if pkey not in meeting_of_pair:
-                    continue
-                meet = meeting_of_pair[pkey]
-                if pair_invalid(a_id, b_id, meet):
-                    newly_spilled_after_sampling.append((a_id, b_id))
+            if to_spill_layer_defects:
+                # ★ Ausnahme (Defekte) -> direkt Spillover
+                for (a, b) in to_spill_layer_defects:
+                    key = frozenset({a, b})
+                    meet = fixed_meetings.get(key)
+                    if meet is not None:
+                        mark_meeting_failed((a, b), meet)
+                    to_meeting_plans.pop(a, None)
+                    to_meeting_plans.pop(b, None)
+                    fixed_meetings.pop(key, None)
+                layers[idx+1:idx+1] = [to_spill_layer_defects]
 
-            if newly_spilled_after_sampling:
-                for (a_id, b_id) in newly_spilled_after_sampling:
-                    attempt_full.pop(a_id, None)
-                    attempt_full.pop(b_id, None)
-                    meeting_of_pair.pop(frozenset({a_id, b_id}), None)
-                    pre_in_paths.pop(a_id, None)
-                    pre_in_paths.pop(b_id, None)
-                layers[idx+1:idx+1] = [newly_spilled_after_sampling]
-
-            # Wenn nach Sampling/Spill nichts mehr übrig ist → Wartebatch
-            if not pre_in_paths:
-                wait_batch: Dict[int, List[TimedNode]] = {}
-                for q in qubits:
-                    qid = q.id
-                    wait_batch[qid] = [(current_pos[qid], 0), (current_pos[qid], 1)]
-                batch_plans.append(wait_batch)
-                add_defect_snapshots(1)
+            if not fixed_meetings:
+                wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
+                batch_plans.append(wait)
+                snapshot_defects(1)
                 idx += 1
                 continue
 
-            # 2) Synchronisiere auf T_pre (max über alle) und führe deterministisch aus
-            T_pre_sync = max(
-                DefaultRoutingPlanner._first_pre_in_time(attempt_full[qid], meeting_of_pair[frozenset({a, b})])
-                if frozenset({a, b}) in meeting_of_pair and qid in (a, b) else 0
-                for (a, b) in layer_pairs for qid in (a, b)
-                if frozenset({a, b}) in meeting_of_pair
-            )
+            # ===== Schritt 4: Ausführung in drei Microbatches =====
+            # 4a) Non-Layer Evakuierung zuerst
+            if evac_plans:
+                micro_evacuate: Dict[int, List[TimedNode]] = {}
+                for qid, path in evac_plans.items():
+                    micro_evacuate[qid] = path
+                # Nicht betroffene warten bis Ende des Evakuierungsbatches
+                dur = max((p[-1][1] for p in micro_evacuate.values()), default=0)
+                for qid in (all_qids - set(micro_evacuate.keys())):
+                    micro_evacuate[qid] = [(current_pos[qid], 0), (current_pos[qid], dur)]
+                batch_plans.append(micro_evacuate)
+                snapshot_defects(1)
+                # Positionen aktualisieren
+                for qid in evac_plans:
+                    current_pos[qid] = evac_plans[qid][-1][0]
 
-            micro_paths_approach: Dict[int, List[TimedNode]] = {}
-            layer_qids = {q for ab in layer_pairs if frozenset(ab) in meeting_of_pair for q in ab}
-            for (a_id, b_id) in layer_pairs:
-                pkey = frozenset({a_id, b_id})
-                if pkey not in meeting_of_pair:
+            # 4b) Layer-Anschnitt bis PRE-IN, synchronisiert auf T_pre_sync
+            micro_to_pre: Dict[int, List[TimedNode]] = {}
+            exec_layer_qids: Set[int] = set()
+            for (a, b) in layer_pairs:
+                key = frozenset({a, b})
+                if key not in fixed_meetings:
                     continue
-                meet = meeting_of_pair[pkey]
-                for qid in (a_id, b_id):
-                    cut = DefaultRoutingPlanner._retime_until_pre_in_wait(attempt_full[qid], meet, T_pre_sync)
-                    micro_paths_approach[qid] = cut
+                meet = fixed_meetings[key]
+                for qid in (a, b):
+                    cut = LayerFirstRoutingPlanner._retime_until_pre_in_wait(
+                        to_meeting_plans[qid], meet, T_pre_sync
+                    )
+                    micro_to_pre[qid] = cut
+                    exec_layer_qids.add(qid)
 
-            # Qubits außerhalb des Layers warten sichtbar bis T_pre_sync+1
-            others = qids_all - layer_qids
+            # Nicht-Layer + nicht-beteiligte Layer warten sichtbar
+            others = all_qids - exec_layer_qids
+            dur_pre = max((p[-1][1] for p in micro_to_pre.values()), default=0)
             for qid in others:
-                micro_paths_approach[qid] = [(current_pos[qid], 0), (current_pos[qid], T_pre_sync + 1)]
+                micro_to_pre[qid] = [(current_pos[qid], 0), (current_pos[qid], dur_pre)]
+            batch_plans.append(micro_to_pre)
+            snapshot_defects(1)
 
-            batch_plans.append(micro_paths_approach)
-            add_defect_snapshots(1)
+            # Positionen aktualisieren (Layer stehen nun am PRE-IN)
+            for qid in exec_layer_qids:
+                current_pos[qid] = micro_to_pre[qid][-1][0]
 
-            # Positionen aktualisieren (alle Layer-Qubits stehen nun am PRE-IN)
-            for qid in layer_qids:
-                current_pos[qid] = micro_paths_approach[qid][-1][0]
-
-            # 3) kurzer IN-Hop (rein und sofort raus auf PRE-IN), nur wenn Hop-Kanten nicht defekt
+            # 4c) kurzer IN-Hop (PRE-IN -> IN -> PRE-IN) für alle verbleibenden Paare
             micro_in: Dict[int, List[TimedNode]] = {}
-            for (a_id, b_id) in layer_pairs:
-                pkey = frozenset({a_id, b_id})
-                if pkey not in meeting_of_pair:
+            for (a, b) in layer_pairs:
+                key = frozenset({a, b})
+                if key not in fixed_meetings:
                     continue
-                meet = meeting_of_pair[pkey]
-
-                # Prüfe Hop-Kanten erneut (sollte bereits oben geprüft sein)
-                pre_a = current_pos[a_id]
-                pre_b = current_pos[b_id]
+                meet = fixed_meetings[key]
+                pre_a = current_pos[a]
+                pre_b = current_pos[b]
                 if (frozenset({pre_a, meet}) in defective_edges) or (frozenset({pre_b, meet}) in defective_edges):
-                    # Wenn Hop nicht möglich ist, verzichtbar: beide warten (oder ins nächste Layer verschieben).
-                    # Hier: sichtbar warten 2 Schritte.
-                    micro_in[a_id] = [(pre_a, 0), (pre_a, 2)]
-                    micro_in[b_id] = [(pre_b, 0), (pre_b, 2)]
-                    continue
+                    # Falls Zwischenzeit Defekt, beide warten 2 Ticks
+                    micro_in[a] = [(pre_a, 0), (pre_a, 2)]
+                    micro_in[b] = [(pre_b, 0), (pre_b, 2)]
+                else:
+                    micro_in[a] = [(pre_a, 0), (meet, 1), (pre_a, 2)]
+                    micro_in[b] = [(pre_b, 0), (meet, 1), (pre_b, 2)]
 
-                # Regulärer kurzer Hop: PRE-IN -> IN -> PRE-IN
-                micro_in[a_id] = [(pre_a, 0), (meet, 1), (pre_a, 2)]
-                micro_in[b_id] = [(pre_b, 0), (meet, 1), (pre_b, 2)]
-
-            # Nicht beteiligte Qubits warten sichtbar
-            for qid in (qids_all - {q for ab in layer_pairs if frozenset(ab) in meeting_of_pair for q in ab}):
+            # Andere warten 2 Ticks
+            rest = all_qids - {q for ab in layer_pairs if frozenset(ab) in fixed_meetings for q in ab}
+            for qid in rest:
                 micro_in[qid] = [(current_pos[qid], 0), (current_pos[qid], 2)]
-
             batch_plans.append(micro_in)
-            add_defect_snapshots(1)
+            snapshot_defects(1)
+
+            succeeded_pairs = [tuple(sorted(k)) for k in fixed_meetings.keys()]
+            for a, b in succeeded_pairs:
+                tried_meetings.pop(frozenset({a, b}), None)
 
             idx += 1
 
-        # Timelines + Zeitbänder für defekte Kanten erzeugen
-        return DefaultRoutingPlanner.stitch_batches(qubits, batch_plans, batch_defects)
+        # Stitchen wie im Default
+        return LayerFirstRoutingPlanner.stitch_batches(qubits, batch_plans, batch_defects)
 
 
 
-
-    # Helpers
-    #--------------------------------------------
+    # ---------- Schritt 1: Layer-only Planung ----------
     @staticmethod
-    def _nearest_free_sn(
+    def _plan_layer_only(
         G: nx.Graph,
-        source: Coord,
-        avoid: Set[Coord],
-    ) -> Optional[Coord]:
-        """Finde das nächstgelegene SN (BFS), das nicht in 'avoid' liegt."""
-        from collections import deque
-        q = deque([source])
-        seen = {source}
-        while q:
-            u = q.popleft()
-            if G.nodes[u]["type"] == "SN" and u not in avoid:
-                return u
-            for v in G.neighbors(u):
-                if v not in seen:
-                    seen.add(v)
-                    q.append(v)
-        return None
+        current_pos: Dict[int, Coord],
+        layer_pairs: List[Tuple[int, int]],
+        layer_starts: Set[Coord],
+        defective_edges: Set[frozenset],
+        banned_meetings: Optional[Dict[frozenset, Set[Coord]]] = None,
+        all_ins: Optional[Set[Coord]] = None,
+    ) -> Tuple[Dict[int, List[TimedNode]], Dict[frozenset, Coord], bool, List[Tuple[int, int]], List[Tuple[int, int]] ]:
+        """
+        Plane nur die Layer-Paare (kollisionsfrei) bis zu *besten* Meeting-INs:
+          - Minimale *Gesamtdistanz* zu beiden Startknoten (Tie-break via maxdist, balance, Knoten-ID)
+          - Einzigartige INs pro Paar
+          - Pfade dürfen *keinen* Startknoten eines Layer-Qubits (außer eigenes Start) enthalten
+          - Alle PRE-INs im Layer müssen unterschiedlich sein
+          - 🔧 NEU: Pfade dürfen KEINE PRE-INs anderer Layer-Qubits im selben Layer enthalten
+          - Non-Layer werden NICHT berücksichtigt
+        """
+        res = Reservations(G, blocked_edges=defective_edges)
+        plans: Dict[int, List[TimedNode]] = {}
+        fixed_meetings: Dict[frozenset, Coord] = {}
+        unplaceable: List[Tuple[int, int]] = []
+
+        banned_meetings = banned_meetings or {}
+        all_ins = all_ins or set()
+        exhausted_pairs: List[Tuple[int, int]] = []
 
 
-    @staticmethod
-    def _first_pre_in_time(path: List[TimedNode], meeting: Coord) -> Optional[int]:
-        """Zeitstempel der ersten Ankunft am PRE-IN (Schritt vor der *ersten* Meeting-Ankunft)."""
-        first_meet_idx = None
-        for i, (c, t) in enumerate(path):
-            if c == meeting:
-                first_meet_idx = i
+        # Startknoten zum Blockieren in der Suche (außer eigener Start)
+        def forbidden_for(qid: int) -> Set[Coord]:
+            return set(layer_starts) - {current_pos[qid]}
+
+        # Kandidatenreihenfolge je Paar vorbereiten
+        cand_per_pair: Dict[Tuple[int, int], List[Coord]] = {}
+        for (a, b) in layer_pairs:
+            qa, qb = current_pos[a], current_pos[b]
+            cand_per_pair[(a, b)] = LayerFirstRoutingPlanner._best_meeting_candidates(
+                G, qa, qb, reserved=set(), forbidden_nodes=set()
+            )
+
+        # Greedy: Paare mit wenig Kandidaten zuerst
+        order = sorted(layer_pairs, key=lambda ab: len(cand_per_pair.get(ab, [])))
+
+        reserved_in: Set[Coord] = set()
+        for (a, b) in order:
+            qa, qb = current_pos[a], current_pos[b]
+            placed = False
+
+            # 🔧 Bereits akzeptierte PRE-INs anderer Layer-Qubits sammeln
+            cur_preins_map = LayerFirstRoutingPlanner._preins_for_plans(plans, fixed_meetings)
+            existing_preins: Set[Coord] = set(cur_preins_map.values()) if cur_preins_map else set()
+
+            # Kandidaten dynamisch (unter Berücksichtigung bereits reservierter INs)
+            cands_all = LayerFirstRoutingPlanner._best_meeting_candidates(
+                G, qa, qb, reserved=reserved_in, forbidden_nodes=set()
+            )
+            banned = banned_meetings.get(frozenset({a, b}), set())
+            cands = [c for c in cands_all if c not in banned]
+
+            # Falls für dieses Paar *keine* Kandidaten mehr übrig sind: exhaustion merken
+            if not cands and all_ins and len(banned) >= len(all_ins):
+                exhausted_pairs.append((a, b))
+
+            for meet in cands:
+                # Suche kollisionsfrei (nur Layer) bis zum Meeting
+                res_try = deepcopy(res)
+
+                # 🔧 PRE-INs anderer bereits gesetzter Layer-Qubits blockieren
+                if existing_preins:
+                    LayerFirstRoutingPlanner._block_nodes(res_try, existing_preins)
+
+                # A zuerst: fremde Layer-Starts für A blockieren
+                LayerFirstRoutingPlanner._block_nodes(res_try, forbidden_for(a))
+                pa = AStar.search(G, qa, meet, res_try)
+                if pa is None:
+                    continue
+                Reservations.commit(res_try, pa)
+
+                # B danach: fremde Layer-Starts für B blockieren
+                # 🔧 PRE-INs anderer bereits gesetzter Layer-Qubits erneut sicher blocken
+                if existing_preins:
+                    LayerFirstRoutingPlanner._block_nodes(res_try, existing_preins)
+
+                LayerFirstRoutingPlanner._block_nodes(res_try, forbidden_for(b))
+                pb = AStar.search(G, qb, meet, res_try)
+                if pb is None:
+                    continue
+
+                # PRE-INs extrahieren
+                pre_a = LayerFirstRoutingPlanner._entry_sn_from_path(pa, meet)
+                pre_b = LayerFirstRoutingPlanner._entry_sn_from_path(pb, meet)
+                if pre_a is None or pre_b is None:
+                    continue
+
+
+                # PRE-INs auf Eindeutigkeit prüfen *im Kontext* aller bisher akzeptierten
+                tmp_plans = dict(plans); tmp_plans[a] = pa; tmp_plans[b] = pb
+                tmp_fixed = dict(fixed_meetings); tmp_fixed[frozenset({a, b})] = meet
+                preins = LayerFirstRoutingPlanner._preins_for_plans(tmp_plans, tmp_fixed)
+                if preins is None:
+                    continue
+                # Prüfe Eindeutigkeit nur innerhalb der Layer-Qubits
+                prein_vals = [preins[qid] for qid in preins if qid in {x for ab in layer_pairs for x in ab}]
+                if len(set(prein_vals)) != len(prein_vals):
+                    # versuche anderen IN
+                    continue
+
+                # akzeptieren
+                res = res_try
+                plans[a] = pa; plans[b] = pb
+                fixed_meetings[frozenset({a, b})] = meet
+                reserved_in.add(meet)
+                placed = True
                 break
-        if first_meet_idx is None:
-            return None
-        if first_meet_idx == 0:
-            return path[0][1]
-        return path[first_meet_idx - 1][1]
-    
-    @staticmethod
-    def _try_commit(res: Reservations, path: List[TimedNode]) -> bool:
-        """Prüft und commitet 'path' Schritt für Schritt in 'res'.
-        Gibt False zurück, falls Kapazitäten/Edge-Exklusivität verletzt würden."""
-        if not path:
-            return False
-        # erster Knoten
-        n0, t0 = path[0]
-        if not res.can_occupy(n0, t0):
-            return False
-        res.occupy_node(n0, t0)
 
-        for (u, tu), (v, tv) in zip(path[:-1], path[1:]):
-            # Zielknoten verfügbar?
-            if not res.can_occupy(v, tv):
-                return False
-            # Kante frei, falls Bewegung
-            if u != v and not res.can_traverse(u, v, tu):
-                return False
-            res.occupy_node(v, tv)
-            if u != v:
-                res.traverse_edge(u, v, tu)
-        return True
+            if not placed:
+                unplaceable.append((a, b))
+
+        # final prüfen, ob PRE-INs eindeutig (sollten es sein)
+        preins_ok = True
+        preins = LayerFirstRoutingPlanner._preins_for_plans(plans, fixed_meetings)
+        if preins is None:
+            preins_ok = False
+        else:
+            lv = [preins[qid] for qid in preins if qid in {x for ab in layer_pairs for x in ab}]
+            preins_ok = (len(set(lv)) == len(lv))
+
+        return plans, fixed_meetings, preins_ok, unplaceable, exhausted_pairs
+
+
+
+    # ---------- Schritt 4 Helfer: kurzen IN-Hop + Vorbereitung ----------
+    @staticmethod
+    def _path_nodes_of_pair(plans: Dict[int, List[TimedNode]], a: int, b: int) -> Set[Coord]:
+        s: Set[Coord] = set()
+        for qid in (a, b):
+            for c, _ in plans.get(qid, []):
+                s.add(c)
+        return s
 
     @staticmethod
-    def _retime_to_pre_in_wait(
-        path: List[TimedNode],
-        meeting: Coord,
-        sync_time: int,
-    ) -> Optional[List[TimedNode]]:
-        """Lässt ein zu frühes Ankommen am PRE-IN warten und betritt den IN erst bei sync_time.
-        Erwartet 'path' als gültigen Pfad, der im Meeting endet."""
-        if not path:
-            return None
-        # Zeitpunkt der ersten Ankunft im Meeting
-        first_meet_idx = None
-        for i, (c, _) in enumerate(path):
-            if c == meeting:
-                first_meet_idx = i
-                break
-        if first_meet_idx is None:
-            return None  # path endet nicht im meeting (sollte nicht passieren)
+    def _collect_layer_nodes(
+        plans: Dict[int, List[TimedNode]],
+        fixed_meetings: Dict[frozenset, Coord],
+    ) -> Set[Coord]:
+        S: Set[Coord] = set()
+        for p in plans.values():
+            for c, _ in p:
+                S.add(c)
+        for m in fixed_meetings.values():
+            S.add(m)
+        return S
 
-        # Falls Pfad schon bei sync_time ankommt (oder später): nichts zu tun
-        Ta = path[-1][1]
-        if Ta >= sync_time:
-            return path
+    # ---------- Kandidatenwahl (minimale Gesamtdistanz) ----------
+    @staticmethod
+    def _best_meeting_candidates(
+        G: nx.Graph,
+        q0: Coord,
+        q1: Coord,
+        reserved: Optional[Set[Coord]] = None,
+        forbidden_nodes: Optional[Set[Coord]] = None,
+    ) -> List[Coord]:
+        reserved = reserved or set()
+        forbidden_nodes = forbidden_nodes or set()
 
-        # PRE-IN bestimmen (Schritt direkt vor erster Meeting-Ankunft)
-        if first_meet_idx == 0:
-            # Startet bereits im Meeting → kein PRE-IN existiert; fallback: am Meeting warten
-            # (Verhalten wie bisher)
-            ext = path.copy()
-            while ext[-1][1] < sync_time:
-                n, t = ext[-1]
-                ext.append((n, t + 1))
-            return ext
+        d0 = nx.single_source_shortest_path_length(G, q0)
+        d1 = nx.single_source_shortest_path_length(G, q1)
+        ins = [n for n in G if G.nodes[n]["type"] == "IN" and n in d0 and n in d1]
 
-        pre_in = path[first_meet_idx - 1][0]
-        t_pre_in = path[first_meet_idx - 1][1]
+        cands = [n for n in ins if n not in reserved and n not in forbidden_nodes]
+        # sortiere nach: Summe, dann max, dann Balance, dann Knoten-ID
+        cands.sort(key=lambda n: (d0[n] + d1[n], max(d0[n], d1[n]), abs(d0[n] - d1[n]), n))
+        return cands
 
-        # Neu zusammensetzen:
-        #  - bis inkl. PRE-IN original lassen
-        #  - ab t_pre_in+1 bis sync_time-1 am PRE-IN warten
-        #  - in Schritt (sync_time-1 -> sync_time) in den Meeting-Knoten gehen
-        new_path = path[: first_meet_idx]  # endet bei PRE-IN zur Zeit t_pre_in
-
-        # am PRE-IN warten
-        cur_t = t_pre_in
-        while cur_t + 1 < sync_time:
-            new_path.append((pre_in, cur_t + 1))
-            cur_t += 1
-
-        # finaler Schritt ins Meeting bei sync_time
-        new_path.append((meeting, sync_time))
-        return new_path
-
+    # ---------- PRE-IN Auswertung ----------
     @staticmethod
     def _entry_sn_from_path(path: List[TimedNode], meeting: Coord) -> Optional[Coord]:
-        """
-        Given a path that ends at `meeting`, return the node that was visited
-        immediately before the *first* arrival at `meeting` (the SN they used
-        to enter the IN). If the path starts at the meeting, return None.
-        """
         first_meet_idx = None
         for i, (c, _) in enumerate(path):
             if c == meeting:
@@ -691,6 +635,88 @@ class DefaultRoutingPlanner:
         return path[first_meet_idx - 1][0]
 
     @staticmethod
+    def _preins_for_plans(
+        plans: Dict[int, List[TimedNode]],
+        fixed_meetings: Dict[frozenset, Coord],
+    ) -> Optional[Dict[int, Coord]]:
+        preins: Dict[int, Coord] = {}
+        for pair_key, meet in fixed_meetings.items():
+            qids = list(pair_key)
+            if len(qids) != 2:
+                return None
+            for qid in qids:
+                path = plans.get(qid)
+                if not path:
+                    return None
+                pin = LayerFirstRoutingPlanner._entry_sn_from_path(path, meet)
+                if pin is None:
+                    return None
+                preins[qid] = pin
+        return preins
+
+    @staticmethod
+    def _prein_conflicts(
+        plans: Dict[int, List[TimedNode]],
+        fixed_meetings: Dict[frozenset, Coord],
+    ) -> List[Tuple[int, int]]:
+        """Liefert Liste von Paaren, deren PRE-IN Eindeutigkeit bricht."""
+        pre = LayerFirstRoutingPlanner._preins_for_plans(plans, fixed_meetings)
+        if pre is None:
+            # alle Paare potenziell betroffen
+            return [tuple(sorted(k)) for k in fixed_meetings.keys()]  # type: ignore
+        seen: Dict[Coord, int] = {}
+        conflicts: Set[Tuple[int, int]] = set()
+        for pair_key in fixed_meetings.keys():
+            a, b = list(pair_key)
+            for qid in (a, b):
+                pin = pre[qid]
+                if pin in seen and seen[pin] != qid:
+                    conflicts.add(tuple(sorted((qid, seen[pin]))))
+                else:
+                    seen[pin] = qid
+        # Konflikte auf Paare mappen: grob/konservativ – jedes Paar, dessen Qubit beteiligt ist
+        bad_pairs: Set[Tuple[int, int]] = set()
+        for (x, y) in conflicts:
+            for pair_key in fixed_meetings.keys():
+                a, b = list(pair_key)
+                if x in (a, b) or y in (a, b):
+                    bad_pairs.add(tuple(sorted((a, b))))
+        return list(bad_pairs)
+
+    # ---------- Schneiden/Timing ----------
+    @staticmethod
+    def _retime_until_pre_in_wait(
+        path: List[TimedNode],
+        meeting: Coord,
+        sync_time: int,
+    ) -> Optional[List[TimedNode]]:
+        if not path:
+            return None
+        first_meet_idx = None
+        for i, (c, _) in enumerate(path):
+            if c == meeting:
+                first_meet_idx = i
+                break
+        if first_meet_idx is None:
+            return None
+        if first_meet_idx == 0:
+            start_node, start_t = path[0]
+            new_path = [(start_node, start_t)]
+            cur = start_t
+            while cur < sync_time:
+                new_path.append((start_node, cur + 1))
+                cur += 1
+            return new_path
+        pre_in, t_pre = path[first_meet_idx - 1]
+        new_path = path[: first_meet_idx]
+        cur = t_pre
+        while cur < sync_time:
+            new_path.append((pre_in, cur + 1))
+            cur += 1
+        return new_path
+
+    # ---------- MAPF Wrapper identisch zum Stil im Default ----------
+    @staticmethod
     def _mapf_to_targets(
         G: nx.Graph,
         starts: Dict[int, Coord],
@@ -698,32 +724,24 @@ class DefaultRoutingPlanner:
         blocked_nodes: Optional[Set[Coord]] = None,
         blocked_edges: Optional[Set[frozenset]] = None,
     ) -> Dict[int, List[TimedNode]]:
-        """
-        Collision-free multi-agent routing from per-qubit start -> target.
-        Uses the same A* and Reservations; no synchronization needed.
-        """
         if not starts:
             return {}
-
         res = Reservations(G, blocked_edges=blocked_edges or set())
         blocked_nodes = blocked_nodes or set()
 
-        # Ghost-Startknoten der noch nicht erfolgreichen Qubits
-        # für die Dauer des Microbatches voll blockieren.
+        # Blockiere verbotene Knoten über gesamten Horizont
         for node in blocked_nodes:
             cap = res.node_capacity(node)
             for t in range(0, MAX_TIME + 1):
                 res.node_caps[node][t] = cap
-        plans: Dict[int, List[TimedNode]] = {}
 
-        # Pre-occupy all start nodes at t=0 to reflect initial occupancy
+        plans: Dict[int, List[TimedNode]] = {}
+        # Startknoten bei t=0 belegen
         for qid, s in starts.items():
             res.occupy_node(s, 0)
 
-        # Plan "harder first": by (Chebyshev) distance descending
         def cheb(a: Coord, b: Coord) -> int:
             return max(abs(a[0]-b[0]), abs(a[1]-b[1]))
-
         order = sorted(starts.keys(), key=lambda q: cheb(starts[q], targets[q]), reverse=True)
 
         for qid in order:
@@ -733,6 +751,177 @@ class DefaultRoutingPlanner:
                 raise RuntimeError(f"Return routing failed for qubit {qid} from {s} -> {t}")
             res.commit(path)
             plans[qid] = path
+        return plans
+
+    # ---------- Defekt-Sampling & Prüfungen ----------
+    @staticmethod
+    def _sample_edge_failures(
+        G: nx.Graph,
+        defective_edges: Set[frozenset],
+        p_fail: float,
+        p_repair: float,
+    ) -> None:
+        for u, v in G.edges():
+            e = frozenset({u, v})
+            if e in defective_edges:
+                if random.random() < p_repair:
+                    defective_edges.discard(e)
+            else:
+                if random.random() < p_fail:
+                    defective_edges.add(e)
+
+    @staticmethod
+    def _path_uses_defective_edge(path: List[TimedNode], defective_edges: Set[frozenset]) -> bool:
+        for (u, _), (v, _) in zip(path[:-1], path[1:]):
+            if u != v and frozenset({u, v}) in defective_edges:
+                return True
+        return False
+
+    # ---------- Utility: freies SN in BFS-Nähe ----------
+    @staticmethod
+    def _nearest_free_sn(G: nx.Graph, source: Coord, avoid: Set[Coord]) -> Optional[Coord]:
+        from collections import deque
+        q = deque([source])
+        seen = {source}
+        while q:
+            u = q.popleft()
+            if G.nodes[u]["type"] == "SN" and u not in avoid:
+                return u
+            for v in G.neighbors(u):
+                if v not in seen:
+                    seen.add(v); q.append(v)
+        return None
+
+    # ---------- Stitcher (delegiert an Default-Implementierung) ----------
+    @staticmethod
+    def _block_nodes(res: Reservations, nodes: Set[Coord]) -> None:
+        for node in nodes:
+            cap = res.node_capacity(node)
+            for t in range(0, MAX_TIME + 1):
+                # volle Auslastung -> für A* unbetretbar
+                res.node_caps[node][t] = cap
+
+    @staticmethod
+    def _resolve_evacuate_collisions_with_waiters(
+        G: nx.Graph,
+        evac_plans: Dict[int, List[TimedNode]],
+        targets: Dict[int, Coord],
+        current_pos: Dict[int, Coord],
+        waiting_qids: Set[int],
+        blocked_nodes: Set[Coord],
+        defective_edges: Set[frozenset],
+    ) -> Dict[int, List[TimedNode]]:
+        """
+        Rekursive/Chain-Handover-Auflösung:
+        Findet entlang eines Mover-Pfads ggf. mehrere wartende Blocker in Reihenfolge.
+        Bildet daraus eine Handover-Kette:
+            mover -> b1 -> b2 -> ... -> bK -> (mover_target)
+        und replante das *gesamte* Evakuierungsset (alle bisherigen Mover + beteiligte Blocker)
+        gemeinsam via MAPF, um Kollisionen zuverlässig zu vermeiden.
+
+        Fallback, falls Gesamt-Replan fehlschlägt: versuche einfachen Handover nur mit dem ersten Blocker.
+        """
+        if not evac_plans:
+            return {}
+
+        plans = dict(evac_plans)  # Kopie
+        wait_pos: Dict[int, Coord] = {qid: current_pos[qid] for qid in waiting_qids}
+        targets_local: Dict[int, Coord] = dict(targets)
+
+        def build_blocker_chain_along_path(path: List[TimedNode]) -> List[int]:
+            chain: List[int] = []
+            seen: Set[int] = set()
+            # Wir betrachten die Zielknoten der Schritte (node_next)
+            for (_, _t_prev), (node_next, _t_next) in zip(path[:-1], path[1:]):
+                # Prüfe, ob node_next von einem wartenden Qubit besetzt ist
+                for bqid, bpos in wait_pos.items():
+                    if bqid not in seen and node_next == bpos:
+                        chain.append(bqid)
+                        seen.add(bqid)
+            return chain
+
+        changed = True
+        while changed:
+            changed = False
+
+            # Iteriere über eine Momentaufnahme, da wir 'plans' modifizieren könnten
+            for mover_qid, mover_path in plans.items():
+                # Finde Blocker entlang des Mover-Pfads (in Reihenfolge des Auftretens)
+                chain_blockers = build_blocker_chain_along_path(mover_path)
+                if not chain_blockers:
+                    continue
+
+                # --- Versuche: Replan für das *gesamte* Evakuierungsset + Chain-Blocker ---
+                                # --- Versuche: Replan für das *gesamte* Evakuierungsset + Chain-Blocker ---
+                # Plan the union of current movers and chain blockers, but only if each has a target.
+                chain_agents: List[int] = [mover_qid] + chain_blockers
+                agents_to_plan: Set[int] = set(plans.keys()) | set(chain_blockers)
+
+                # Starts for all agents we intend to plan now
+                starts: Dict[int, Coord] = {qid: current_pos[qid] for qid in agents_to_plan}
+
+                # Base targets: whatever we already have for those agents
+                new_targets_full: Dict[int, Coord] = {
+                    qid: targets_local[qid] for qid in agents_to_plan if qid in targets_local
+                }
+
+                # Chain assignments: mover -> pos(b1), b1 -> pos(b2), ..., last -> original mover target
+                valid_chain = True
+                for i, agent in enumerate(chain_agents):
+                    if i < len(chain_agents) - 1:
+                        nxt = chain_agents[i + 1]
+                        new_targets_full[agent] = current_pos[nxt]
+                    else:
+                        if mover_qid in targets_local:
+                            new_targets_full[agent] = targets_local[mover_qid]
+                        else:
+                            valid_chain = False
+                            break
+
+                # Every agent we plan must have a target (avoids KeyError downstream)
+                if valid_chain and agents_to_plan.issubset(new_targets_full.keys()):
+                    try:
+                        replanned = LayerFirstRoutingPlanner._mapf_to_targets(
+                            G=G,
+                            starts=starts,
+                            targets=new_targets_full,
+                            blocked_nodes=blocked_nodes,
+                            blocked_edges=defective_edges,
+                        )
+                        # Success: update plans and persist the targets for these agents
+                        for qid, path in replanned.items():
+                            plans[qid] = path
+                            targets_local[qid] = new_targets_full[qid]
+
+                        # Chain blockers are no longer "waiting"
+                        for bqid in chain_blockers:
+                            wait_pos.pop(bqid, None)
+
+                        changed = True
+                        break
+
+                    except RuntimeError:
+                        # Fallback: simple two-agent handover (mover <-> first blocker)
+                        b1 = chain_blockers[0]
+                        try:
+                            partial = LayerFirstRoutingPlanner._mapf_to_targets(
+                                G=G,
+                                starts={mover_qid: current_pos[mover_qid], b1: current_pos[b1]},
+                                targets={mover_qid: current_pos[b1], b1: targets_local.get(mover_qid, current_pos[b1])},
+                                blocked_nodes=blocked_nodes,
+                                blocked_edges=defective_edges,
+                            )
+                            plans[mover_qid] = partial[mover_qid]
+                            plans[b1] = partial[b1]
+                            # Persist targets for both so future iterations remain consistent
+                            targets_local[mover_qid] = current_pos[b1]
+                            targets_local[b1] = targets_local.get(mover_qid, current_pos[b1])
+
+                            wait_pos.pop(b1, None)
+                            changed = True
+                            break
+                        except RuntimeError:
+                            continue
 
         return plans
     
@@ -811,203 +1000,16 @@ class DefaultRoutingPlanner:
         return timelines, edge_timebands
 
 
-
     @staticmethod
-    def _collect_layer_forbidden_nodes(
-        attempt_full: Dict[int, List[TimedNode]],
-        meeting_of_pair: Dict[frozenset, Coord],
-    ) -> Set[Coord]:
-        """Alle vom Layer genutzten Knoten (Pfadknoten inkl. PRE-IN + INs)."""
-        F: Set[Coord] = set()
-        for path in attempt_full.values():
-            for c, _ in path:
-                F.add(c)
-        for m in meeting_of_pair.values():
-            F.add(m)
-        return F
-
-    @staticmethod
-    def _evacuate_blocking_non_layer(
-        G: nx.Graph,
-        qubits: List[Qubit],
-        current_pos: Dict[int, Coord],
-        layer_pairs: List[Tuple[int, int]],
-        attempt_full: Dict[int, List[TimedNode]],
-        meeting_of_pair: Dict[frozenset, Coord],
-        batch_plans: List[Dict[int, List[TimedNode]]],
-    ) -> Set[Coord]:
-        """
-        Bewegt NUR Non-Layer-Qubits, deren *aktuelle Position* Layer-Pfade/INs blockiert.
-        Deterministisch, ohne probabilistische Resets.
-        Routen bleiben strikt außerhalb der vom Layer benötigten Knoten.
-
-        Rückgabe: Menge verbleibender blockierender Positionen (leer = alles frei).
-        """
-        if not attempt_full:
-            return set()
-
-        qids_all: Set[int] = {q.id for q in qubits}
-        layer_qids: Set[int] = {q for ab in layer_pairs for q in ab}
-        others: List[int] = [qid for qid in qids_all if qid not in layer_qids]
-
-        # Knoten, die der Layer benötigt (Pfadknoten + INs) + Startknoten der Layer-Qubits
-        F_layer = DefaultRoutingPlanner._collect_layer_forbidden_nodes(attempt_full, meeting_of_pair)
-        layer_starts: Set[Coord] = {current_pos[qid] for qid in layer_qids}
-        F_all = set(F_layer) | set(layer_starts)
-
-        # Blocker = Non-Layer-Qubits, die derzeit im Layer-Gebiet stehen
-        blockers: List[int] = [qid for qid in others if current_pos[qid] in F_layer]
-        if not blockers:
-            return set()  # nichts im Weg
-
-        occupied_now: Set[Coord] = {current_pos[qid] for qid in qids_all}
-        avoid: Set[Coord] = set(occupied_now) | F_all
-
-        # Ziele: nächste freie SN außerhalb des Layer-Gebiets (ohne Doppelziele)
-        targets: Dict[int, Coord] = {}
-        for qid in blockers:
-            tgt = DefaultRoutingPlanner._nearest_free_sn(G, current_pos[qid], avoid)
-            if tgt is not None:
-                targets[qid] = tgt
-                avoid.add(tgt)
-
-        if not targets:
-            # keiner fand ein Ziel → alle ursprünglichen Blocker-Positionen bleiben
-            return {current_pos[qid] for qid in blockers}
-
-        starts = {qid: current_pos[qid] for qid in targets}
-        blocked_nodes = F_all  # Evakuierungswege dürfen KEINEN Layer-Knoten betreten
-
-        micro: Dict[int, List[TimedNode]] = {}
-
-        # 1) Versuche gemeinsame kollisionsfreie Planung
-        try:
-            plans = DefaultRoutingPlanner._mapf_to_targets(
-                G, starts, targets, blocked_nodes=blocked_nodes
-            )
-            # Ausführen (deterministisch): füge Pfade in einen Microbatch ein
-            for qid, path in plans.items():
-                micro[qid] = path
-                current_pos[qid] = path[-1][0]
-        except RuntimeError:
-            # 2) Fallback: agent-weise, jeweils mit aktueller Sperrmenge erweitern
-            #    Erfolgreiche Moves blockieren ihre Zielknoten für nachfolgende.
-            blocked_now = set(blocked_nodes)
-            for qid, tgt in targets.items():
-                try:
-                    one = DefaultRoutingPlanner._mapf_to_targets(
-                        G, {qid: current_pos[qid]}, {qid: tgt}, blocked_nodes=blocked_now
-                    )
-                    path = one[qid]
-                    micro[qid] = path
-                    current_pos[qid] = path[-1][0]
-                    blocked_now.add(current_pos[qid])
-                except RuntimeError:
-                    # Keine Route für diesen Agenten (bleibt stehen)
-                    pass
-
-        if micro:
-            batch_plans.append(micro)
-
-        # Erneut prüfen: welche Non-Layer stehen noch auf Layer-Knoten?
-        remaining_blockers: Set[Coord] = set()
-        for qid in others:
-            if current_pos[qid] in F_layer:
-                remaining_blockers.add(current_pos[qid])
-
-        return remaining_blockers
-
-    
-    @staticmethod
-    def _preins_for_plans(
-        plans: Dict[int, List[TimedNode]],
-        fixed_meetings: Dict[frozenset, Coord],
-    ) -> Optional[Dict[int, Coord]]:
-        """
-        Liefert für alle in fixed_meetings enthaltenen Qubits den PRE-IN-Knoten.
-        Gibt None zurück, falls ein Pfad fehlt oder irgendein PRE-IN nicht bestimmbar ist.
-        """
-        preins: Dict[int, Coord] = {}
-        for pair_key, meet in fixed_meetings.items():
-            qids = list(pair_key)
-            if len(qids) != 2:
-                return None
-            for qid in qids:
-                path = plans.get(qid)
-                if not path:
-                    return None
-                pin = DefaultRoutingPlanner._entry_sn_from_path(path, meet)
-                if pin is None:
-                    return None
-                preins[qid] = pin
-        return preins
-    
-    @staticmethod
-    def _retime_until_pre_in_wait(
-        path: List[TimedNode],
-        meeting: Coord,
-        sync_time: int,
-    ) -> Optional[List[TimedNode]]:
-        """
-        Schneidet 'path' so ab, dass er am PRE-IN endet und dort bis 'sync_time' wartet.
-        Gibt einen Pfad zurück, der mit PRE-IN @ sync_time endet (Meeting wird NICHT betreten).
-        """
-        if not path:
-            return None
-
-        # Index der ersten Ankunft am Meeting
-        first_meet_idx = None
-        for i, (c, _) in enumerate(path):
-            if c == meeting:
-                first_meet_idx = i
-                break
-        if first_meet_idx is None:
-            return None  # path endet nicht im meeting (sollte nicht passieren)
-
-        if first_meet_idx == 0:
-            # Start bereits im Meeting → PRE-IN existiert nicht; wir warten einfach im Start, bis sync_time
-            start_node, start_t = path[0]
-            new_path = [(start_node, start_t)]
-            cur_t = start_t
-            while cur_t < sync_time:
-                new_path.append((start_node, cur_t + 1))
-                cur_t += 1
-            return new_path
-
-        pre_in, t_pre_in = path[first_meet_idx - 1]
-        new_path = path[: first_meet_idx]  # endet am PRE-IN (Zeit t_pre_in)
-
-        # Warte am PRE-IN bis sync_time
-        cur_t = t_pre_in
-        while cur_t < sync_time:
-            new_path.append((pre_in, cur_t + 1))
-            cur_t += 1
-        return new_path
-    
-
-    @staticmethod
-    def _sample_edge_failures(
-        G: nx.Graph,
-        defective_edges: Set[frozenset],
-        p_fail: float,
-        p_repair: float,
-    ) -> None:
-        # Aktualisiert das Set in place
-        for u, v in G.edges():
-            e = frozenset({u, v})
-            if e in defective_edges:
-                # Reparaturversuch
-                if random.random() < p_repair:
-                    defective_edges.discard(e)
-            else:
-                # Neuer Fehler
-                if random.random() < p_fail:
-                    defective_edges.add(e)
-
-    @staticmethod
-    def _path_uses_defective_edge(path: List[TimedNode], defective_edges: Set[frozenset]) -> bool:
-        for (u, _), (v, _) in zip(path[:-1], path[1:]):
-            if u != v and frozenset({u, v}) in defective_edges:
-                return True
-        return False
-    
+    def _debug_print_meetings(layer_idx: int, fixed_meetings: Dict[frozenset, Coord], header: str = "") -> None:
+        if header:
+            print(header)
+        if not fixed_meetings:
+            print(f"[Layer {layer_idx}] Keine Meeting-INs fixiert.")
+            return
+        print(f"[Layer {layer_idx}] Fixierte Meeting-INs:")
+        # Stabil und lesbar: Paare sortiert ausgeben
+        for pair_key in sorted(fixed_meetings.keys(), key=lambda k: tuple(sorted(k))):
+            a, b = sorted(pair_key)
+            meet = fixed_meetings[pair_key]
+            print(f"  Paar ({a}, {b}) -> IN {meet}")

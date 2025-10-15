@@ -4,10 +4,10 @@ from typing import Dict, List, Tuple, Set, Optional
 
 import networkx as nx
 from routing.common import Coord, TimedNode, Qubit
-from routing.default_routing import DefaultRoutingPlanner, P_REPAIR, P_SUCCESS
+from routing.default_routing import LayerFirstRoutingPlanner, P_REPAIR, P_SUCCESS
 
 
-class RoutingPlannerWithRerouting(DefaultRoutingPlanner):
+class RoutingPlannerWithRerouting(LayerFirstRoutingPlanner):
     """
     Wie DefaultRoutingPlanner, jedoch mit Rerouting innerhalb eines Layers:
     Wenn nach dem Sampling eine Kante auf einem Layer-Pfad defekt ist, wird versucht,

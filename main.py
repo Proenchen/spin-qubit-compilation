@@ -3,9 +3,8 @@ import random
 from typing import List, Tuple
 from routing.common import Qubit
 from routing.network import NetworkBuilder
-from routing.default_routing import DefaultRoutingPlanner
 from routing.routing_with_reroute import RoutingPlannerWithRerouting
-from routing.default_routing_new import LayerFirstRoutingPlanner
+from routing.default_routing import LayerFirstRoutingPlanner
 from utils.animation import animate_mapf
 
 if __name__ == "__main__":

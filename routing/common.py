@@ -60,15 +60,6 @@ class Reservations:
             if u != v:
                 self.traverse_edge(u, v, t)
 
-    @staticmethod
-    def _block_nodes(res: Reservations, nodes: Set[Coord]) -> None:
-        for node in nodes:
-            cap = res.node_capacity(node)
-            for t in range(0, MAX_TIME + 1):
-                # volle Auslastung -> für A* unbetretbar
-                res.node_caps[node][t] = cap
-
-
 
 class AStar:
     """A* search that minimizes (moves first, then time) and respects reservations."""
