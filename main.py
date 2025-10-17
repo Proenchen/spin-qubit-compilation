@@ -3,8 +3,8 @@ import random
 from typing import List, Tuple
 from routing.common import Qubit
 from routing.network import NetworkBuilder
-from routing.routing_with_reroute import RoutingPlannerWithRerouting
-from routing.default_routing import LayerFirstRoutingPlanner
+from routing.routing_with_reroute import RerouteRoutingPlanner
+from routing.default_routing import DefaultRoutingPlanner
 from utils.animation import animate_mapf
 
 if __name__ == "__main__":
@@ -18,7 +18,7 @@ if __name__ == "__main__":
     random.seed(42)
 
     qubits: List[Qubit] = [
-        Qubit(0, (0, -1)),
+        Qubit(0, (2, -3)),
         Qubit(1, (1,  0)),
         Qubit(2, (-1, 0)),
         Qubit(3, (2, -1)),
@@ -39,7 +39,7 @@ if __name__ == "__main__":
         (qubits[4], qubits[5]),  #6
     ]
 
-    planner = LayerFirstRoutingPlanner()
-    #planner = RoutingPlannerWithRerouting()
+    planner = DefaultRoutingPlanner()
+    #planner = RerouteRoutingPlanner()
     timelines, edge_timebands = planner.route(G, qubits, pairs)
     animate_mapf(G, timelines, edge_timebands=edge_timebands, smooth=True)

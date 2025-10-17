@@ -10,7 +10,7 @@ P_SUCCESS = 0.98
 P_REPAIR = 0.25
 
 
-class LayerFirstRoutingPlanner:
+class DefaultRoutingPlanner:
     """
     Routing in Layern mit (1) Auswahl bester Meeting-INs rein nach Layer,
     (2) gezielter Evakuierung blockierender Non-Layer, (3) Sampling persistenter
@@ -96,7 +96,7 @@ class LayerFirstRoutingPlanner:
                 preins_ok,                 # True/False, ob PRE-INs schon eindeutig
                 unplaceable_pairs_step1,   # Paare, die trotz Durchprobieren aller Kandidaten nicht platzbar sind
                 exhausted_pairs_step1,     # ★ Paare, für die *alle* INs schon global verboten wurden
-            ) = LayerFirstRoutingPlanner._plan_layer_only(
+            ) = DefaultRoutingPlanner._plan_layer_only(
                 G=G,
                 current_pos=current_pos,
                 layer_pairs=layer_pairs,
@@ -110,7 +110,7 @@ class LayerFirstRoutingPlanner:
             if exhausted_pairs_step1:
                 layers[idx+1:idx+1] = [exhausted_pairs_step1]
 
-            LayerFirstRoutingPlanner._debug_print_meetings(idx, fixed_meetings, header="-- Nach _plan_layer_only --")
+            DefaultRoutingPlanner._debug_print_meetings(idx, fixed_meetings, header="-- Nach _plan_layer_only --")
 
             # Paare aus Schritt 1 nicht planbar → Spillover (wir haben alle Kandidaten versucht)
             if unplaceable_pairs_step1:
@@ -130,7 +130,7 @@ class LayerFirstRoutingPlanner:
                 continue
 
             # Menge der vom Layer genutzten Knoten (für Evakuierungs-Sperren)
-            F_layer: Set[Coord] = LayerFirstRoutingPlanner._collect_layer_nodes(to_meeting_plans, fixed_meetings)
+            F_layer: Set[Coord] = DefaultRoutingPlanner._collect_layer_nodes(to_meeting_plans, fixed_meetings)
             F_all = set(F_layer) | set(layer_starts)
 
             # ===== Schritt 2: Blockierende Non-Layer evakuieren (nur falls nötig) =====
@@ -149,7 +149,7 @@ class LayerFirstRoutingPlanner:
                     key = frozenset({a, b})
                     if key not in fixed_meetings:
                         continue
-                    nodes = LayerFirstRoutingPlanner._path_nodes_of_pair(to_meeting_plans, a, b)
+                    nodes = DefaultRoutingPlanner._path_nodes_of_pair(to_meeting_plans, a, b)
                     pair_path_nodes[(a, b)] = nodes
                     for n in nodes:
                         node_to_pairs.setdefault(n, []).append((a, b))
@@ -164,7 +164,7 @@ class LayerFirstRoutingPlanner:
                 avoid_for_targets = set(occupied_now) | F_all
                 targets: Dict[int, Coord] = {}
                 for qid in blockers_now:
-                    tgt = LayerFirstRoutingPlanner._nearest_free_sn(G, current_pos[qid], avoid_for_targets)
+                    tgt = DefaultRoutingPlanner._nearest_free_sn(G, current_pos[qid], avoid_for_targets)
                     if tgt is not None and tgt not in F_layer:
                         targets[qid] = tgt
                         avoid_for_targets.add(tgt)
@@ -198,7 +198,7 @@ class LayerFirstRoutingPlanner:
                 evacuating = {qid: current_pos[qid] for qid in blockers_now if qid in targets}
                 if evacuating:
                     try:
-                        evac_plans = LayerFirstRoutingPlanner._mapf_to_targets(
+                        evac_plans = DefaultRoutingPlanner._mapf_to_targets(
                             G=G,
                             starts=evacuating,
                             targets={qid: targets[qid] for qid in evacuating},
@@ -211,7 +211,7 @@ class LayerFirstRoutingPlanner:
                         blocked_now = set(F_all)
                         for qid in evacuating:
                             try:
-                                one = LayerFirstRoutingPlanner._mapf_to_targets(
+                                one = DefaultRoutingPlanner._mapf_to_targets(
                                     G=G,
                                     starts={qid: current_pos[qid]},
                                     targets={qid: targets[qid]},
@@ -235,7 +235,7 @@ class LayerFirstRoutingPlanner:
                 # === Kollisionen mit wartenden Non-Layer auflösen (Handover-Regel) ===
                 if evac_plans:
                     waiting_qids = (non_layer_qids - set(evacuating.keys()))
-                    evac_plans = LayerFirstRoutingPlanner._resolve_evacuate_collisions_with_waiters(
+                    evac_plans = DefaultRoutingPlanner._resolve_evacuate_collisions_with_waiters(
                         G=G,
                         evac_plans=evac_plans,
                         targets={qid: targets[qid] for qid in evacuating},  # Ziele der bewegenden Non-Layer
@@ -243,6 +243,7 @@ class LayerFirstRoutingPlanner:
                         waiting_qids=waiting_qids,
                         blocked_nodes=F_all,               # Layer-Knoten tabu
                         defective_edges=defective_edges,   # respektiere Defekte
+                        blocker_to_pair=blocker_to_pair
                     )
 
             # ★ Falls wir neu planen wollen: springe zum Schleifenanfang (gleiches Layer, neue IN-Wahl)
@@ -257,7 +258,7 @@ class LayerFirstRoutingPlanner:
                 continue
 
             # ===== Schritt 3: Sampling defekter Kanten und Validierung =====
-            LayerFirstRoutingPlanner._sample_edge_failures(
+            DefaultRoutingPlanner._sample_edge_failures(
                 G, defective_edges, p_fail=(1.0 - p_success), p_repair=p_repair
             )
 
@@ -265,12 +266,13 @@ class LayerFirstRoutingPlanner:
             if evac_plans:
                 to_spill_for_nonlayer: Set[Tuple[int, int]] = set()
                 for qid, path in evac_plans.items():
-                    if LayerFirstRoutingPlanner._path_uses_defective_edge(path, defective_edges):
+                    if DefaultRoutingPlanner._path_uses_defective_edge(path, defective_edges):
                         ab = blocker_to_pair.get(qid)
                         if ab:
                             to_spill_for_nonlayer.add(ab)
+
                 if to_spill_for_nonlayer:
-                    # ★ Echte Defekte -> direkt Spillover
+                    # ★ Echte Defekte -> direkt Spillover der betroffenen Paare
                     for (a, b) in to_spill_for_nonlayer:
                         key = frozenset({a, b})
                         meet = fixed_meetings.get(key)
@@ -280,6 +282,9 @@ class LayerFirstRoutingPlanner:
                         to_meeting_plans.pop(b, None)
                         fixed_meetings.pop(key, None)
                     layers[idx+1:idx+1] = [list(to_spill_for_nonlayer)]
+
+                    # *** Alles-oder-nichts: keine Evakuierung in diesem Microbatch ***
+                    evac_plans.clear()
 
             if not fixed_meetings:
                 wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
@@ -297,7 +302,7 @@ class LayerFirstRoutingPlanner:
                     continue
                 meet = fixed_meetings[key]
                 for qid in (a, b):
-                    cut = LayerFirstRoutingPlanner._retime_until_pre_in_wait(
+                    cut = DefaultRoutingPlanner._retime_until_pre_in_wait(
                         to_meeting_plans[qid], meet, 0
                     )
                     if cut is None:
@@ -338,10 +343,10 @@ class LayerFirstRoutingPlanner:
                     # Hier landen wir nicht mehr (würden oben replannen), lassen aber konservativ drin
                     to_spill_layer_defects.append((a, b))
                     continue
-                if LayerFirstRoutingPlanner._path_uses_defective_edge(pa, defective_edges):
+                if DefaultRoutingPlanner._path_uses_defective_edge(pa, defective_edges):
                     to_spill_layer_defects.append((a, b))
                     continue
-                if LayerFirstRoutingPlanner._path_uses_defective_edge(pb, defective_edges):
+                if DefaultRoutingPlanner._path_uses_defective_edge(pb, defective_edges):
                     to_spill_layer_defects.append((a, b))
                     continue
                 pre_a = pa[-1][0]
@@ -371,6 +376,11 @@ class LayerFirstRoutingPlanner:
             # ===== Schritt 4: Ausführung in drei Microbatches =====
             # 4a) Non-Layer Evakuierung zuerst
             if evac_plans:
+                evac_plans = {
+                    qid: path
+                    for qid, path in evac_plans.items()
+                    if not DefaultRoutingPlanner._path_uses_defective_edge(path, defective_edges)
+                }
                 micro_evacuate: Dict[int, List[TimedNode]] = {}
                 for qid, path in evac_plans.items():
                     micro_evacuate[qid] = path
@@ -393,7 +403,7 @@ class LayerFirstRoutingPlanner:
                     continue
                 meet = fixed_meetings[key]
                 for qid in (a, b):
-                    cut = LayerFirstRoutingPlanner._retime_until_pre_in_wait(
+                    cut = DefaultRoutingPlanner._retime_until_pre_in_wait(
                         to_meeting_plans[qid], meet, T_pre_sync
                     )
                     micro_to_pre[qid] = cut
@@ -442,7 +452,7 @@ class LayerFirstRoutingPlanner:
             idx += 1
 
         # Stitchen wie im Default
-        return LayerFirstRoutingPlanner.stitch_batches(qubits, batch_plans, batch_defects)
+        return DefaultRoutingPlanner.stitch_batches(qubits, batch_plans, batch_defects)
 
 
 
@@ -484,7 +494,7 @@ class LayerFirstRoutingPlanner:
         cand_per_pair: Dict[Tuple[int, int], List[Coord]] = {}
         for (a, b) in layer_pairs:
             qa, qb = current_pos[a], current_pos[b]
-            cand_per_pair[(a, b)] = LayerFirstRoutingPlanner._best_meeting_candidates(
+            cand_per_pair[(a, b)] = DefaultRoutingPlanner._best_meeting_candidates(
                 G, qa, qb, reserved=set(), forbidden_nodes=set()
             )
 
@@ -497,11 +507,11 @@ class LayerFirstRoutingPlanner:
             placed = False
 
             # 🔧 Bereits akzeptierte PRE-INs anderer Layer-Qubits sammeln
-            cur_preins_map = LayerFirstRoutingPlanner._preins_for_plans(plans, fixed_meetings)
+            cur_preins_map = DefaultRoutingPlanner._preins_for_plans(plans, fixed_meetings)
             existing_preins: Set[Coord] = set(cur_preins_map.values()) if cur_preins_map else set()
 
             # Kandidaten dynamisch (unter Berücksichtigung bereits reservierter INs)
-            cands_all = LayerFirstRoutingPlanner._best_meeting_candidates(
+            cands_all = DefaultRoutingPlanner._best_meeting_candidates(
                 G, qa, qb, reserved=reserved_in, forbidden_nodes=set()
             )
             banned = banned_meetings.get(frozenset({a, b}), set())
@@ -517,10 +527,10 @@ class LayerFirstRoutingPlanner:
 
                 # 🔧 PRE-INs anderer bereits gesetzter Layer-Qubits blockieren
                 if existing_preins:
-                    LayerFirstRoutingPlanner._block_nodes(res_try, existing_preins)
+                    DefaultRoutingPlanner._block_nodes(res_try, existing_preins)
 
                 # A zuerst: fremde Layer-Starts für A blockieren
-                LayerFirstRoutingPlanner._block_nodes(res_try, forbidden_for(a))
+                DefaultRoutingPlanner._block_nodes(res_try, forbidden_for(a))
                 pa = AStar.search(G, qa, meet, res_try)
                 if pa is None:
                     continue
@@ -529,16 +539,16 @@ class LayerFirstRoutingPlanner:
                 # B danach: fremde Layer-Starts für B blockieren
                 # 🔧 PRE-INs anderer bereits gesetzter Layer-Qubits erneut sicher blocken
                 if existing_preins:
-                    LayerFirstRoutingPlanner._block_nodes(res_try, existing_preins)
+                    DefaultRoutingPlanner._block_nodes(res_try, existing_preins)
 
-                LayerFirstRoutingPlanner._block_nodes(res_try, forbidden_for(b))
+                DefaultRoutingPlanner._block_nodes(res_try, forbidden_for(b))
                 pb = AStar.search(G, qb, meet, res_try)
                 if pb is None:
                     continue
 
                 # PRE-INs extrahieren
-                pre_a = LayerFirstRoutingPlanner._entry_sn_from_path(pa, meet)
-                pre_b = LayerFirstRoutingPlanner._entry_sn_from_path(pb, meet)
+                pre_a = DefaultRoutingPlanner._entry_sn_from_path(pa, meet)
+                pre_b = DefaultRoutingPlanner._entry_sn_from_path(pb, meet)
                 if pre_a is None or pre_b is None:
                     continue
 
@@ -546,7 +556,7 @@ class LayerFirstRoutingPlanner:
                 # PRE-INs auf Eindeutigkeit prüfen *im Kontext* aller bisher akzeptierten
                 tmp_plans = dict(plans); tmp_plans[a] = pa; tmp_plans[b] = pb
                 tmp_fixed = dict(fixed_meetings); tmp_fixed[frozenset({a, b})] = meet
-                preins = LayerFirstRoutingPlanner._preins_for_plans(tmp_plans, tmp_fixed)
+                preins = DefaultRoutingPlanner._preins_for_plans(tmp_plans, tmp_fixed)
                 if preins is None:
                     continue
                 # Prüfe Eindeutigkeit nur innerhalb der Layer-Qubits
@@ -568,7 +578,7 @@ class LayerFirstRoutingPlanner:
 
         # final prüfen, ob PRE-INs eindeutig (sollten es sein)
         preins_ok = True
-        preins = LayerFirstRoutingPlanner._preins_for_plans(plans, fixed_meetings)
+        preins = DefaultRoutingPlanner._preins_for_plans(plans, fixed_meetings)
         if preins is None:
             preins_ok = False
         else:
@@ -648,7 +658,7 @@ class LayerFirstRoutingPlanner:
                 path = plans.get(qid)
                 if not path:
                     return None
-                pin = LayerFirstRoutingPlanner._entry_sn_from_path(path, meet)
+                pin = DefaultRoutingPlanner._entry_sn_from_path(path, meet)
                 if pin is None:
                     return None
                 preins[qid] = pin
@@ -660,7 +670,7 @@ class LayerFirstRoutingPlanner:
         fixed_meetings: Dict[frozenset, Coord],
     ) -> List[Tuple[int, int]]:
         """Liefert Liste von Paaren, deren PRE-IN Eindeutigkeit bricht."""
-        pre = LayerFirstRoutingPlanner._preins_for_plans(plans, fixed_meetings)
+        pre = DefaultRoutingPlanner._preins_for_plans(plans, fixed_meetings)
         if pre is None:
             # alle Paare potenziell betroffen
             return [tuple(sorted(k)) for k in fixed_meetings.keys()]  # type: ignore
@@ -810,6 +820,7 @@ class LayerFirstRoutingPlanner:
         waiting_qids: Set[int],
         blocked_nodes: Set[Coord],
         defective_edges: Set[frozenset],
+        blocker_to_pair: Dict[int, Tuple[int, int]]
     ) -> Dict[int, List[TimedNode]]:
         """
         Rekursive/Chain-Handover-Auflösung:
@@ -828,17 +839,30 @@ class LayerFirstRoutingPlanner:
         wait_pos: Dict[int, Coord] = {qid: current_pos[qid] for qid in waiting_qids}
         targets_local: Dict[int, Coord] = dict(targets)
 
-        def build_blocker_chain_along_path(path: List[TimedNode]) -> List[int]:
+        # Signatur anpassen: root_pair (des Movers) reinreichen
+        def build_blocker_chain_along_path(
+            path: List[TimedNode],
+            root_pair: Optional[Tuple[int, int]],
+        ) -> List[int]:
             chain: List[int] = []
             seen: Set[int] = set()
+
             # Wir betrachten die Zielknoten der Schritte (node_next)
             for (_, _t_prev), (node_next, _t_next) in zip(path[:-1], path[1:]):
                 # Prüfe, ob node_next von einem wartenden Qubit besetzt ist
                 for bqid, bpos in wait_pos.items():
-                    if bqid not in seen and node_next == bpos:
+                    if bqid in seen:
+                        continue
+                    if node_next == bpos:
                         chain.append(bqid)
                         seen.add(bqid)
+
+                        # ★ WICHTIG: Paar-Zuordnung des Movers auf den Blocker übertragen
+                        if root_pair is not None:
+                            blocker_to_pair.setdefault(bqid, root_pair)
+
             return chain
+
 
         changed = True
         while changed:
@@ -846,8 +870,9 @@ class LayerFirstRoutingPlanner:
 
             # Iteriere über eine Momentaufnahme, da wir 'plans' modifizieren könnten
             for mover_qid, mover_path in plans.items():
+                root_pair = blocker_to_pair.get(mover_qid)
                 # Finde Blocker entlang des Mover-Pfads (in Reihenfolge des Auftretens)
-                chain_blockers = build_blocker_chain_along_path(mover_path)
+                chain_blockers = build_blocker_chain_along_path(mover_path, root_pair)
                 if not chain_blockers:
                     continue
 
@@ -881,7 +906,7 @@ class LayerFirstRoutingPlanner:
                 # Every agent we plan must have a target (avoids KeyError downstream)
                 if valid_chain and agents_to_plan.issubset(new_targets_full.keys()):
                     try:
-                        replanned = LayerFirstRoutingPlanner._mapf_to_targets(
+                        replanned = DefaultRoutingPlanner._mapf_to_targets(
                             G=G,
                             starts=starts,
                             targets=new_targets_full,
@@ -904,7 +929,7 @@ class LayerFirstRoutingPlanner:
                         # Fallback: simple two-agent handover (mover <-> first blocker)
                         b1 = chain_blockers[0]
                         try:
-                            partial = LayerFirstRoutingPlanner._mapf_to_targets(
+                            partial = DefaultRoutingPlanner._mapf_to_targets(
                                 G=G,
                                 starts={mover_qid: current_pos[mover_qid], b1: current_pos[b1]},
                                 targets={mover_qid: current_pos[b1], b1: targets_local.get(mover_qid, current_pos[b1])},
