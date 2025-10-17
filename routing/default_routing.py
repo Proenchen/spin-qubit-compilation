@@ -8,6 +8,7 @@ from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubi
 
 P_SUCCESS = 1
 P_REPAIR = 0.25
+MAX_REPLANS = 50,
 
 
 class DefaultRoutingPlanner:
@@ -47,16 +48,6 @@ class DefaultRoutingPlanner:
         total_ins: Set[Coord] = {n for n in G if G.nodes[n].get("type") == "IN"}
         tried_meetings: Dict[frozenset, Set[Coord]] = {}
 
-        def mark_meeting_failed(pair: Tuple[int, int], meet: Coord):
-            key = frozenset(pair)
-            s = tried_meetings.setdefault(key, set())
-            s.add(meet)
-            # Optionales Debug:
-            print(
-                f"[route] Markiere Meeting-IN {meet} als gescheitert für Paar {tuple(sorted(pair))} "
-                f"({len(s)}/{len(total_ins)} versucht)"
-            )
-
         def snapshot_defects(n: int):
             for _ in range(n):
                 batch_defects.append(set(defective_edges))
@@ -80,7 +71,9 @@ class DefaultRoutingPlanner:
 
         # ---------- Hauptschleife ----------
         idx = 0
+        replan_counts: Dict[int, int] = {}
         while idx < len(layers):
+            tried_meetings.clear()
             layer_pairs = layers[idx]
             layer_qids: Set[int] = {x for ab in layer_pairs for x in ab}
             non_layer_qids: Set[int] = all_qids - layer_qids
@@ -187,8 +180,6 @@ class DefaultRoutingPlanner:
                         seen_pairs.add(pkey)
                         unique_pairs.append(ab)
                         meet = fixed_meetings.get(pkey)
-                        if meet is not None:
-                            mark_meeting_failed(ab, meet)  # ★ nur dieses IN verbieten
                         to_meeting_plans.pop(ab[0], None)
                         to_meeting_plans.pop(ab[1], None)
                         fixed_meetings.pop(pkey, None)
@@ -225,8 +216,6 @@ class DefaultRoutingPlanner:
                                 if ab:
                                     pkey = frozenset(ab)
                                     meet = fixed_meetings.get(pkey)
-                                    if meet is not None:
-                                        mark_meeting_failed(ab, meet)  # ★ nur IN verbieten
                                     to_meeting_plans.pop(ab[0], None)
                                     to_meeting_plans.pop(ab[1], None)
                                     fixed_meetings.pop(pkey, None)
@@ -248,6 +237,11 @@ class DefaultRoutingPlanner:
 
             # ★ Falls wir neu planen wollen: springe zum Schleifenanfang (gleiches Layer, neue IN-Wahl)
             if replan_current_layer:
+                replan_counts[idx] = replan_counts.get(idx, 0) + 1
+                if replan_counts[idx] > MAX_REPLANS:
+                    raise RuntimeError(
+                        f"Kein gültiges Routing für Layer {idx} nach {replan_counts[idx]} Neuplanungen."
+                    )
                 continue
 
             if not fixed_meetings:
@@ -276,8 +270,6 @@ class DefaultRoutingPlanner:
                     for (a, b) in to_spill_for_nonlayer:
                         key = frozenset({a, b})
                         meet = fixed_meetings.get(key)
-                        if meet is not None:
-                            mark_meeting_failed((a, b), meet)
                         to_meeting_plans.pop(a, None)
                         to_meeting_plans.pop(b, None)
                         fixed_meetings.pop(key, None)
@@ -308,8 +300,6 @@ class DefaultRoutingPlanner:
                     if cut is None:
                         # ★ kein Defekt → anderes IN probieren (nicht Spillover)
                         meet2 = fixed_meetings.get(key)
-                        if meet2 is not None:
-                            mark_meeting_failed((a, b), meet2)
                         to_meeting_plans.pop(a, None)
                         to_meeting_plans.pop(b, None)
                         fixed_meetings.pop(key, None)
@@ -359,8 +349,6 @@ class DefaultRoutingPlanner:
                 for (a, b) in to_spill_layer_defects:
                     key = frozenset({a, b})
                     meet = fixed_meetings.get(key)
-                    if meet is not None:
-                        mark_meeting_failed((a, b), meet)
                     to_meeting_plans.pop(a, None)
                     to_meeting_plans.pop(b, None)
                     fixed_meetings.pop(key, None)
@@ -444,11 +432,6 @@ class DefaultRoutingPlanner:
                 micro_in[qid] = [(current_pos[qid], 0), (current_pos[qid], 2)]
             batch_plans.append(micro_in)
             snapshot_defects(1)
-
-            succeeded_pairs = [tuple(sorted(k)) for k in fixed_meetings.keys()]
-            for a, b in succeeded_pairs:
-                tried_meetings.pop(frozenset({a, b}), None)
-
             idx += 1
 
         # Stitchen wie im Default

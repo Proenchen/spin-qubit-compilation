@@ -9,15 +9,15 @@ from utils.animation import animate_mapf
 
 if __name__ == "__main__":
     G, qubits, pairs = NetworkBuilder.place_qubits_and_make_pairs(
-        width=3,
-        height=3,
-        n_qubits=5,
-        rounds=1,
-        seed=42,  
+        width=2,
+        height=2,
+        n_qubits=7,
+        rounds=5,
+        seed=44,  
     )
-    random.seed()
+    """ random.seed(42)
 
-    """  qubits: List[Qubit] = [
+    qubits: List[Qubit] = [
         Qubit(0, (2, -3)),
         Qubit(1, (1,  0)),
         Qubit(2, (-1, 0)),
@@ -36,10 +36,10 @@ if __name__ == "__main__":
         (qubits[3], qubits[5]),  #4
         (qubits[0], qubits[5]),  #5
         (qubits[1], qubits[3]),  #5
-        (qubits[4], qubits[5]),  #6
+        (qubits[4], qubits[5]),  #6 
     ] """
 
-    #planner = DefaultRoutingPlanner()
-    planner = RerouteRoutingPlanner()
+    planner = DefaultRoutingPlanner()
+    #planner = RerouteRoutingPlanner()
     timelines, edge_timebands = planner.route(G, qubits, pairs)
     animate_mapf(G, timelines, edge_timebands=edge_timebands, smooth=True)

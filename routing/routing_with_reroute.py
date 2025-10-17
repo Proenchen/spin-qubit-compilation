@@ -8,6 +8,7 @@ from routing.default_routing import DefaultRoutingPlanner
 
 P_SUCCESS = 1
 P_REPAIR = 0.25
+MAX_REPLANS = 50
 
 
 class RerouteRoutingPlanner(DefaultRoutingPlanner):
@@ -60,7 +61,9 @@ class RerouteRoutingPlanner(DefaultRoutingPlanner):
         if cur: layers.append(cur)
 
         idx = 0
+        replan_counts: Dict[int, int] = {}
         while idx < len(layers):
+            tried_meetings.clear()
             layer_pairs = layers[idx]
             layer_qids: Set[int] = {x for ab in layer_pairs for x in ab}
             non_layer_qids: Set[int] = all_qids - layer_qids
@@ -204,6 +207,11 @@ class RerouteRoutingPlanner(DefaultRoutingPlanner):
                     )
 
             if replan_current_layer:
+                replan_counts[idx] = replan_counts.get(idx, 0) + 1
+                if replan_counts[idx] > MAX_REPLANS:
+                    raise RuntimeError(
+                        f"Kein gültiges Routing für Layer {idx} nach {replan_counts[idx]} Neuplanungen."
+                    )
                 continue
 
             if not fixed_meetings:
