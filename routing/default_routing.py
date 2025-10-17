@@ -6,7 +6,7 @@ import networkx as nx
 
 from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubit
 
-P_SUCCESS = 0.98
+P_SUCCESS = 1
 P_REPAIR = 0.25
 
 
@@ -517,6 +517,11 @@ class DefaultRoutingPlanner:
             banned = banned_meetings.get(frozenset({a, b}), set())
             cands = [c for c in cands_all if c not in banned]
 
+            existing_path_nodes: Set[Coord] = set()
+            for qid, p in plans.items():
+                for c, _ in p:
+                    existing_path_nodes.add(c)
+
             # Falls für dieses Paar *keine* Kandidaten mehr übrig sind: exhaustion merken
             if not cands and all_ins and len(banned) >= len(all_ins):
                 exhausted_pairs.append((a, b))
@@ -529,41 +534,52 @@ class DefaultRoutingPlanner:
                 if existing_preins:
                     DefaultRoutingPlanner._block_nodes(res_try, existing_preins)
 
-                # A zuerst: fremde Layer-Starts für A blockieren
+                # A zuerst
                 DefaultRoutingPlanner._block_nodes(res_try, forbidden_for(a))
                 pa = AStar.search(G, qa, meet, res_try)
                 if pa is None:
                     continue
                 Reservations.commit(res_try, pa)
 
-                # B danach: fremde Layer-Starts für B blockieren
-                # 🔧 PRE-INs anderer bereits gesetzter Layer-Qubits erneut sicher blocken
+                # >>> NEU: pre_a sofort bestimmen und blockieren
+                pre_a = DefaultRoutingPlanner._entry_sn_from_path(pa, meet)
+                if pre_a is None:
+                    continue
+
+                if pre_a in existing_path_nodes:
+                    continue
+                DefaultRoutingPlanner._block_nodes(res_try, {pre_a})
+
+                # (PRE-INs anderer bereits gesetzter Layer-Qubits zusätzlich blockiert lassen)
                 if existing_preins:
                     DefaultRoutingPlanner._block_nodes(res_try, existing_preins)
 
+                # B danach
                 DefaultRoutingPlanner._block_nodes(res_try, forbidden_for(b))
                 pb = AStar.search(G, qb, meet, res_try)
                 if pb is None:
                     continue
 
                 # PRE-INs extrahieren
-                pre_a = DefaultRoutingPlanner._entry_sn_from_path(pa, meet)
                 pre_b = DefaultRoutingPlanner._entry_sn_from_path(pb, meet)
-                if pre_a is None or pre_b is None:
+                if pre_b is None:
                     continue
 
+                if pre_b in existing_path_nodes:
+                    continue
 
-                # PRE-INs auf Eindeutigkeit prüfen *im Kontext* aller bisher akzeptierten
+                # Eindeutigkeit im Layer prüfen (keine gleichen PRE-INs)
                 tmp_plans = dict(plans); tmp_plans[a] = pa; tmp_plans[b] = pb
                 tmp_fixed = dict(fixed_meetings); tmp_fixed[frozenset({a, b})] = meet
                 preins = DefaultRoutingPlanner._preins_for_plans(tmp_plans, tmp_fixed)
                 if preins is None:
                     continue
-                # Prüfe Eindeutigkeit nur innerhalb der Layer-Qubits
                 prein_vals = [preins[qid] for qid in preins if qid in {x for ab in layer_pairs for x in ab}]
                 if len(set(prein_vals)) != len(prein_vals):
-                    # versuche anderen IN
                     continue
+
+                # >>> WICHTIG: auch B reservieren (fehlte bisher in deinem Codepfad)
+                Reservations.commit(res_try, pb)
 
                 # akzeptieren
                 res = res_try
@@ -572,6 +588,7 @@ class DefaultRoutingPlanner:
                 reserved_in.add(meet)
                 placed = True
                 break
+
 
             if not placed:
                 unplaceable.append((a, b))

@@ -6,7 +6,7 @@ import networkx as nx
 from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubit
 from routing.default_routing import DefaultRoutingPlanner
 
-P_SUCCESS = 0.98
+P_SUCCESS = 1
 P_REPAIR = 0.25
 
 
