@@ -6,9 +6,10 @@ import networkx as nx
 
 from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubit
 
-P_SUCCESS = 1
-P_REPAIR = 0.25
-MAX_REPLANS = 50,
+P_SUCCESS = 0.98
+P_REPAIR = 0.8
+MAX_REPLANS = 50
+MAX_GLOBAL_ITERS = 50
 
 
 class DefaultRoutingPlanner:
@@ -72,7 +73,14 @@ class DefaultRoutingPlanner:
         # ---------- Hauptschleife ----------
         idx = 0
         replan_counts: Dict[int, int] = {}
+        global_iter = 0
         while idx < len(layers):
+            global_iter += 1
+            if global_iter > MAX_GLOBAL_ITERS:
+                raise RuntimeError(
+                    f"Abbruch (Safeguard): mehr als {MAX_GLOBAL_ITERS} Iterationen "
+                    f"im Routing-Hauptloop (mögliche Dauerschleife, aktueller Layer = {idx})."
+                )
             tried_meetings.clear()
             layer_pairs = layers[idx]
             layer_qids: Set[int] = {x for ab in layer_pairs for x in ab}
@@ -114,6 +122,13 @@ class DefaultRoutingPlanner:
                     snapshot_defects(1)
                     idx += 1
                     continue
+
+            if not fixed_meetings and not unplaceable_pairs_step1 and not exhausted_pairs_step1:
+                raise RuntimeError(
+                    f"Layer {idx} unlösbar: keine Meeting-INs fixiert und kein Spillover möglich. "
+                    f"Paare: {layer_pairs}"
+            )
+
 
             if not fixed_meetings:
                 wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
