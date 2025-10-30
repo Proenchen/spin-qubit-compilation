@@ -313,8 +313,6 @@ class DefaultRoutingPlanner:
                         to_meeting_plans[qid], meet, 0
                     )
                     if cut is None:
-                        # ★ kein Defekt → anderes IN probieren (nicht Spillover)
-                        meet2 = fixed_meetings.get(key)
                         to_meeting_plans.pop(a, None)
                         to_meeting_plans.pop(b, None)
                         fixed_meetings.pop(key, None)

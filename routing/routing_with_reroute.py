@@ -3,7 +3,7 @@ from typing import Dict, List, Optional, Tuple, Set
 from copy import deepcopy
 import networkx as nx
 
-from routing.common import Coord, MAX_TIME, Reservations, TimedNode, Qubit
+from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubit
 from routing.default_routing import DefaultRoutingPlanner
 
 P_SUCCESS = 1
@@ -370,13 +370,12 @@ class RerouteRoutingPlanner(DefaultRoutingPlanner):
 
             # ===== Schritt 4: Ausführung =====
             # 4a) Non-Layer Evakuierung zuerst (Safety-Net: keine defekten Pfade)
-            if evac_plans:
-                if any(DefaultRoutingPlanner._path_uses_defective_edge(p, defective_edges)
-                    for p in evac_plans.values()):
-                    evac_plans.clear()
+            if evac_plans and any(DefaultRoutingPlanner._path_uses_defective_edge(p, defective_edges)
+                for p in evac_plans.values()):
+                evac_plans.clear()
 
             if evac_plans:
-                micro_evacuate: Dict[int, List[TimedNode]] = {qid: path for qid, path in evac_plans.items()}
+                micro_evacuate: Dict[int, List[TimedNode]] = dict(evac_plans.items())
                 dur = max((p[-1][1] for p in micro_evacuate.values()), default=0)
                 for qid in (all_qids - set(micro_evacuate.keys())):
                     micro_evacuate[qid] = [(current_pos[qid], 0), (current_pos[qid], dur)]

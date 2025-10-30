@@ -5,24 +5,25 @@ from routing.common import Qubit
 from routing.network import NetworkBuilder
 from routing.routing_with_reroute import RerouteRoutingPlanner
 from routing.default_routing import DefaultRoutingPlanner
+from routing.rotation_routing import SequentialDiamondRoutingPlanner
 from utils.animation import animate_mapf
 
 if __name__ == "__main__":
     G, qubits, pairs = NetworkBuilder.place_qubits_and_make_pairs(
         width=2,
         height=2,
-        n_qubits=6,
+        n_qubits=12,
         rounds=5,
-        seed=42,  
+        seed=234324,  
     )
-    random.seed(8234234)
+    """  random.seed(8234234)
     qubits: List[Qubit] = [
         Qubit(0, (2, -3)),
         Qubit(1, (1,  0)),
         Qubit(2, (-1, 0)),
         Qubit(3, (2, -1)),
         Qubit(4, (-1, -2)),
-        Qubit(5, (2,  1))
+        Qubit(5, (2,  1)),
     ]
 
     pairs: List[Tuple[Qubit, Qubit]] = [
@@ -37,8 +38,9 @@ if __name__ == "__main__":
         (qubits[1], qubits[3]),  #5
         (qubits[4], qubits[5]),  #6 
     ] 
-
-    planner = DefaultRoutingPlanner()
+ """
+    #planner = DefaultRoutingPlanner()
     #planner = RerouteRoutingPlanner()
+    planner = SequentialDiamondRoutingPlanner()
     timelines, edge_timebands = planner.route(G, qubits, pairs)
     animate_mapf(G, timelines, edge_timebands=edge_timebands, smooth=True)

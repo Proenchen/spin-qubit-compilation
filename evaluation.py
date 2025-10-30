@@ -53,7 +53,7 @@ def pick_qubits_and_pairs(
 
     pairs: List[Tuple[Qubit, Qubit]] = []
     ids = list(range(n_qubits))
-    for r in range(rounds):
+    for _ in range(rounds):
         rng.shuffle(ids)
         # Pair consecutive ids
         for i in range(0, len(ids) - 1, 2):
@@ -86,7 +86,6 @@ def total_timesteps(timelines: Dict[int, List[TimedNode]]) -> int:
 
 
 def run_one(
-    planner_name: str,
     PlannerClass,
     G: nx.Graph,
     qubits: List[Qubit],
@@ -95,7 +94,7 @@ def run_one(
     p_repair: float,
 ):
     start = time.perf_counter()
-    timelines, edge_timebands = PlannerClass.route(G, qubits, pairs, p_success=p_success, p_repair=p_repair)
+    timelines, _ = PlannerClass.route(G, qubits, pairs, p_success=p_success, p_repair=p_repair)
     end = time.perf_counter()
     return {
         "movements": count_movements(timelines),
@@ -166,7 +165,7 @@ def evaluate(
                     sys.stdout.flush()
 
                     try:
-                        m = run_one(algo_name, PlannerClass, G, qubits, pairs, p_success, p_repair)
+                        m = run_one(PlannerClass, G, qubits, pairs, p_success, p_repair)
                         status = "OK"
                     except Exception as e:
                         m = {"movements": np.nan, "timesteps": np.nan, "runtime_s": np.nan, "exception": 1}
@@ -307,7 +306,7 @@ def _range_inclusive(start: float, stop: float, step: float) -> List[float]:
     # Falls durch Rundung der Endpunkt knapp verfehlt wird, füge ihn hinzu
     if xs and abs(xs[-1] - stop) > 1e-9 and stop > xs[-1]:
         xs.append(round(stop, 10))
-    return sorted(set([x for x in xs if x >= start - 1e-12 and x <= stop + 1e-12]))
+    return sorted([x for x in xs if x >= start - 1e-12 and x <= stop + 1e-12])
 
 # --- ERSETZT die alte param_grid(...) ---
 def param_grid(
@@ -389,7 +388,7 @@ def evaluate_fixed_circuit_ps_pr(
                 )
                 sys.stdout.flush()
                 try:
-                    m = run_one(algo_name, PlannerClass, G, qubits, pairs, p_success=ps, p_repair=pr)
+                    m = run_one(PlannerClass, G, qubits, pairs, p_success=ps, p_repair=pr)
                     status = "OK"
                 except Exception as e:
                     m = {"movements": np.nan, "timesteps": np.nan, "runtime_s": np.nan, "exception": 1}
