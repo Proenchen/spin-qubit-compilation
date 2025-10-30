@@ -17,6 +17,14 @@ class SequentialDiamondRoutingPlanner:
       entsprechend der Bewegungsrichtung des PaarQubits (Kollisionen werden so vermieden).
     - Danach kurzer IN-Hop (PRE-IN -> IN -> PRE-IN) wie im Default.
     - Keine defekten Kanten, kein Sampling.
+
+    Erweiterung:
+    - Befinden sich beide Paar-Qubits zu Beginn der Paarbearbeitung auf *derselben* Raute,
+      wird zunächst *eines* der beiden (deterministisch: b) per Diagonal-Schritt auf eine
+      Raute bewegt, die den anderen Paarpartner nicht enthält. Erst danach erfolgt die
+      Meeting-Suche. Während dieses Vorab-Schritts werden Rotationen anderer Qubits auf
+      der jeweiligen Raute berücksichtigt, *aber* beide Paar-Qubits sind von dieser
+      Rotationskaskade ausgenommen (keine gegenseitige Beeinflussung).
     """
 
     @staticmethod
@@ -68,11 +76,9 @@ class SequentialDiamondRoutingPlanner:
 
             Su = [w for w in _diag_sn_neighbors(u) if w != v]
             Sv = [x for x in _diag_sn_neighbors(v) if x != u]
-            # Finde w ∈ Su und x ∈ Sv, die diagonal verbunden sind (schließt den 4er-Zyklus)
             for w in Su:
                 for x in Sv:
                     if _is_diagonal(w, x):
-                        # Prüfe, dass auch w<->u diagonal ist (per Konstruktion ja) und x<->v diagonal (ja)
                         return [u, v, x, w]  # zyklische Reihenfolge um die Raute
             return None
 
@@ -104,6 +110,62 @@ class SequentialDiamondRoutingPlanner:
                     updates[qid] = diamond[ni]
             return updates
 
+        # ---- Neue Helfer: gemeinsame Raute erkennen & Ausweich-Schritt wählen ----
+        def _shared_diamond(n1: Coord, n2: Coord) -> Optional[List[Coord]]:
+            """Falls es eine Raute gibt, die sowohl n1 als auch n2 enthält, liefere deren 4er-Zyklus."""
+            if not (_is_sn(n1) and _is_sn(n2)):
+                return None
+            for v in _diag_sn_neighbors(n1):
+                d = _diamond_for_edge(n1, v)
+                if d is not None and n2 in d:
+                    return d
+            return None
+        
+        def _diamonds_at_node(n: Coord) -> List[List[Coord]]:
+            """Alle Rauten (4er-Zyklen) zurückgeben, an denen n beteiligt ist."""
+            out: List[List[Coord]] = []
+            if not _is_sn(n):
+                return out
+            seen: Set[Tuple[Coord, Coord, Coord, Coord]] = set()
+            for v in _diag_sn_neighbors(n):
+                d = _diamond_for_edge(n, v)
+                if d is None:
+                    continue
+                # kanonische Repräsentation für Deduplikation
+                canon = tuple(sorted(d))
+                if canon not in seen:
+                    seen.add(canon)
+                    out.append(d)
+            return out
+
+        def _escape_step_along_other_diamond(
+            node: Coord, other: Coord
+        ) -> Optional[Tuple[Coord, List[Coord], int]]:
+            """
+            Bewege 'node' entlang einer Diagonalkante einer Raute, die 'other' NICHT enthält.
+            Liefert (v, diamond, direction) oder None.
+            """
+            Ds = _diamonds_at_node(node)
+            # nur Rauten, die den Partner NICHT enthalten
+            Ds = [D for D in Ds if other not in D]
+            if not Ds:
+                return None
+
+            # deterministische Auswahl: zuerst gefundene "andere" Raute
+            D = Ds[0]
+            i = D.index(node)
+            # zwei mögliche Kanten entlang dieser Raute: successor und predecessor
+            v_forward = D[(i + 1) % 4]
+            v_backward = D[(i - 1) % 4]
+
+            # Wir wählen bevorzugt v_forward (deterministisch). Prüfen, dass es wirklich diagonal ist.
+            for v in (v_forward, v_backward):
+                if _is_diagonal(node, v):
+                    direction = _rotation_direction(D, node, v)
+                    return (v, D, direction)
+            return None
+
+
         # ---------- Pfad-Helfer ----------
         def _shortest_path_nodes(src: Coord, dst: Coord) -> List[Coord]:
             """Einfachster kürzester Pfad auf G (knotenweise)."""
@@ -124,7 +186,6 @@ class SequentialDiamondRoutingPlanner:
             pa = current_pos[a]
             pb = current_pos[b]
 
-            # Meeting-Kandidaten wie im Default, erster gültiger wird genommen
             cands = DefaultRoutingPlanner._best_meeting_candidates(
                 G, pa, pb, reserved=set(), forbidden_nodes=set()
             )
@@ -144,8 +205,6 @@ class SequentialDiamondRoutingPlanner:
                     continue
 
             if meet is None or pathA is None or pathB is None:
-                # Kein Meeting möglich (sollte praktisch nicht vorkommen auf diesem G)
-                # Lasse alle eine Zeiteinheit warten und mache weiter.
                 t += 1
                 append_all_positions()
                 continue
@@ -153,85 +212,117 @@ class SequentialDiamondRoutingPlanner:
             preA = _entry_sn_from_path_nodes(pathA, meet)
             preB = _entry_sn_from_path_nodes(pathB, meet)
             if preA is None or preB is None:
-                # Sicherheitsnetz: wenn PRE-IN nicht bestimmbar, warten wir eine Einheit und weiter
                 t += 1
                 append_all_positions()
                 continue
 
-            # Pfade bis PRE-IN (inklusive Start, inklusive PRE-IN)
-            pathA_to_pre = pathA[: pathA.index(meet)]  # endet auf preA
-            pathB_to_pre = pathB[: pathB.index(meet)]  # endet auf preB
+            # --- NEU: Wegrotieren NUR wenn: gleiche Raute UND beide nicht auf ihrem PRE-IN ---
+            shared = _shared_diamond(pa, pb)
+            if shared is not None and not (pa == preA and pb == preB):
+                # deterministisch bevorzugt: b bewegen, sonst a
+                esc_b = _escape_step_along_other_diamond(pb, pa)
+                esc_a = _escape_step_along_other_diamond(pa, pb)
+
+                move_choice = None
+                mover_id = None
+                if esc_b is not None:
+                    move_choice = esc_b; mover_id = b
+                elif esc_a is not None:
+                    move_choice = esc_a; mover_id = a
+
+                if move_choice is not None:
+                    v, dmd, direction = move_choice
+                    pending_updates: Dict[int, Coord] = {}
+                    # wie gehabt: rotieren, aber beide Paar-Qubits ausnehmen
+                    rot = _compute_diamond_rotation_updates(dmd, direction, exclude={a, b})
+                    pending_updates.update(rot)
+                    pending_updates[mover_id] = v
+
+                    for qid, newp in pending_updates.items():
+                        current_pos[qid] = newp
+
+                    # Positionen & Zeit updaten
+                    pa = current_pos[a]; pb = current_pos[b]
+                    t += 1
+                    append_all_positions()
+
+                    # Pfade zum GLEICHEN Meeting neu berechnen
+                    try:
+                        pathA = _shortest_path_nodes(pa, meet)
+                        pathB = _shortest_path_nodes(pb, meet)
+                    except nx.NetworkXNoPath:
+                        t += 1
+                        append_all_positions()
+                        continue
+
+                    preA = _entry_sn_from_path_nodes(pathA, meet)
+                    preB = _entry_sn_from_path_nodes(pathB, meet)
+                    if preA is None or preB is None:
+                        t += 1
+                        append_all_positions()
+                        continue
+
+                    preA = _entry_sn_from_path_nodes(pathA, meet)
+                    preB = _entry_sn_from_path_nodes(pathB, meet)
+                    if preA is None or preB is None:
+                        t += 1
+                        append_all_positions()
+                        continue
+
+            # --- Pfade bis PRE-IN (inklusive Start, inklusive PRE-IN)
+            pathA_to_pre = pathA[: pathA.index(meet)]
+            pathB_to_pre = pathB[: pathB.index(meet)]
 
             # --- Schrittweise Ausführung bis beide PRE-IN erreicht ---
             idxA = 0
             idxB = 0
 
             while (current_pos[a] != preA) or (current_pos[b] != preB):
-                # Einen Zeitschritt simulieren.
-                # Reihenfolge: A bewegt (falls nötig) → evtl. Raute-Rotation → B bewegt → evtl. Raute-Rotation.
-                # Danach Zeit +1 und alle Positionen loggen.
+                # Reihenfolge: A bewegt → (Raute-Rotation) → B bewegt → (Raute-Rotation)
 
-                # Move A (wenn noch nicht am PRE-IN)
+                # Move A
                 if current_pos[a] != preA and idxA + 1 < len(pathA_to_pre):
                     u = pathA_to_pre[idxA]
                     v = pathA_to_pre[idxA + 1]
-
-                    # Sammle atomare Updates dieses Sub-Schritts
                     pending_updates: Dict[int, Coord] = {}
-
-                    # 1) ggf. Raute-Rotation vorbereiten (alle außer a,b)
                     diamond = _diamond_for_edge(u, v)
                     if diamond is not None:
                         direction = _rotation_direction(diamond, u, v)
-                        rot = _compute_diamond_rotation_updates(diamond, direction, exclude={a, b})
+                        rot = _compute_diamond_rotation_updates(diamond, direction, exclude={a,b})
                         pending_updates.update(rot)
-
-                    # 2) PaarQubit A Schritt vorbereiten
                     pending_updates[a] = v
-
-                    # 3) Anwenden (atomar)
                     for qid, newp in pending_updates.items():
                         current_pos[qid] = newp
                     idxA += 1
 
-                # Move B (wenn noch nicht am PRE-IN)
+                # Move B
                 if current_pos[b] != preB and idxB + 1 < len(pathB_to_pre):
                     u = pathB_to_pre[idxB]
                     v = pathB_to_pre[idxB + 1]
-
                     pending_updates: Dict[int, Coord] = {}
-
                     diamond = _diamond_for_edge(u, v)
                     if diamond is not None:
                         direction = _rotation_direction(diamond, u, v)
-                        rot = _compute_diamond_rotation_updates(diamond, direction, exclude={a, b})
+                        rot = _compute_diamond_rotation_updates(diamond, direction, exclude={b,a})
                         pending_updates.update(rot)
-
                     pending_updates[b] = v
-
                     for qid, newp in pending_updates.items():
                         current_pos[qid] = newp
                     idxB += 1
 
-                # Zeit fortschreiben und Snapshot schreiben
                 t += 1
                 append_all_positions()
 
             # --- kurzer IN-Hop synchron für beide (2 Zeitschritte) ---
-            # Schritt 1: beide in den Meeting-IN
             current_pos[a] = meet
             current_pos[b] = meet
             t += 1
             append_all_positions()
 
-            # Schritt 2: beide zurück auf ihre PRE-IN
             current_pos[a] = preA
             current_pos[b] = preB
             t += 1
             append_all_positions()
 
-        # Lückenlose Zeitleisten sind bereits garantiert (wir haben bei jedem t geschrieben).
-        # edge_timebands: hier leer (keine Defekte/Sampling).
         edge_timebands: List[Tuple[int, int, Set[frozenset]]] = []
-
         return timelines, edge_timebands
