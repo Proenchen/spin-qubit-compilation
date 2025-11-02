@@ -8,8 +8,8 @@ from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubi
 
 P_SUCCESS = 0.98
 P_REPAIR = 0.8
-MAX_REPLANS = 8
-MAX_GLOBAL_ITERS = 8
+MAX_REPLANS = 20
+MAX_GLOBAL_ITERS = 20
 
 
 class DefaultRoutingPlanner:
@@ -28,6 +28,10 @@ class DefaultRoutingPlanner:
         nicht, wird nur das betroffene Paar in ein Spillover-Layer verschoben.
     """
 
+    # Für die Teleportationszählung pro Layer (Side-Channel)
+    LAST_LAYERED_BATCHES: Optional[List[List[Dict[int, List[TimedNode]]]]] = None
+    LAST_TELEPORTATIONS: Optional[int] = None
+
     # ---------- Öffentliche Hauptfunktion ----------
     @staticmethod
     def route(
@@ -45,6 +49,10 @@ class DefaultRoutingPlanner:
         batch_plans: List[Dict[int, List[TimedNode]]] = []
         batch_defects: List[Set[frozenset]] = []
 
+        # NEU: Pro Layer gruppierte Microbatches für Teleportationszählung
+        layered_batches: List[List[Dict[int, List[TimedNode]]]] = []
+        current_layer_batches: List[Dict[int, List[TimedNode]]] = []
+
         # --- Persistente Buchhaltung: probierte Meeting-INs pro Paar ---
         total_ins: Set[Coord] = {n for n in G if G.nodes[n].get("type") == "IN"}
         tried_meetings: Dict[frozenset, Set[Coord]] = {}
@@ -52,6 +60,13 @@ class DefaultRoutingPlanner:
         def snapshot_defects(n: int):
             for _ in range(n):
                 batch_defects.append(set(defective_edges))
+
+        def _close_current_layer_group():
+            """NEU: aktuellen Layer (Sammlung seiner Microbatches) abschließen."""
+            nonlocal current_layer_batches
+            if current_layer_batches:
+                layered_batches.append(current_layer_batches)
+                current_layer_batches = []
 
         # ---------- Layerbildung identisch zu Default ----------
         layers: List[List[Tuple[int, int]]] = []
@@ -88,38 +103,40 @@ class DefaultRoutingPlanner:
             layer_starts: Set[Coord] = {current_pos[q] for q in layer_qids}
             occupied_now: Set[Coord] = {current_pos[q] for q in all_qids}
 
-            replan_current_layer = False  # ★ falls wir im selben Layer neu planen wollen
+            replan_current_layer = False  # falls wir im selben Layer neu planen wollen
 
-            # ===== Schritt 1: Nur Layer planen (beste INs, keine Non-Layer beachten) =====
+            # ===== Schritt 1: Nur Layer planen =====
             (
-                to_meeting_plans,          # qid -> Pfad bis MEETING (mit Kollisionvermeidung)
-                fixed_meetings,            # pair_key -> meeting IN
-                preins_ok,                 # True/False, ob PRE-INs schon eindeutig
-                unplaceable_pairs_step1,   # Paare, die trotz Durchprobieren aller Kandidaten nicht platzbar sind
-                exhausted_pairs_step1,     # ★ Paare, für die *alle* INs schon global verboten wurden
+                to_meeting_plans,
+                fixed_meetings,
+                preins_ok,
+                unplaceable_pairs_step1,
+                exhausted_pairs_step1,
             ) = DefaultRoutingPlanner._plan_layer_only(
                 G=G,
                 current_pos=current_pos,
                 layer_pairs=layer_pairs,
                 layer_starts=layer_starts,
                 defective_edges=defective_edges,
-                banned_meetings=tried_meetings,   # ★ verbotene/gescheiterte INs berücksichtigen
+                banned_meetings=tried_meetings,
                 all_ins=total_ins,
             )
 
-            # ★ statt RuntimeError: Paare mit erschöpften IN-Möglichkeiten in Spillover
+            # Paare ohne Kandidaten → Spillover an nächste Stelle einfügen
             if exhausted_pairs_step1:
                 layers[idx+1:idx+1] = [exhausted_pairs_step1]
 
             DefaultRoutingPlanner._debug_print_meetings(idx, fixed_meetings, header="-- Nach _plan_layer_only --")
 
-            # Paare aus Schritt 1 nicht planbar → Spillover (wir haben alle Kandidaten versucht)
+            # Unplaceable aus Schritt 1 → Spillover
             if unplaceable_pairs_step1:
                 layers[idx+1:idx+1] = [unplaceable_pairs_step1]
                 if not fixed_meetings:
                     wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
                     batch_plans.append(wait)
+                    current_layer_batches.append(wait)  # NEU
                     snapshot_defects(1)
+                    _close_current_layer_group()        # NEU: Layer war "Warten" -> Abschluss
                     idx += 1
                     continue
 
@@ -127,13 +144,14 @@ class DefaultRoutingPlanner:
                 raise RuntimeError(
                     f"Layer {idx} unlösbar: keine Meeting-INs fixiert und kein Spillover möglich. "
                     f"Paare: {layer_pairs}"
-            )
-
+                )
 
             if not fixed_meetings:
                 wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
                 batch_plans.append(wait)
+                current_layer_batches.append(wait)  # NEU
                 snapshot_defects(1)
+                _close_current_layer_group()        # NEU
                 idx += 1
                 continue
 
@@ -177,7 +195,7 @@ class DefaultRoutingPlanner:
                         targets[qid] = tgt
                         avoid_for_targets.add(tgt)
 
-                # Wer keinen Ziel-SN findet → bisher Spillover, jetzt stattdessen IN verbieten & replan
+                # Wer keinen Ziel-SN findet -> IN verbieten & replan
                 cannot_place = [qid for qid in blockers_now if qid not in targets]
                 newly_affected: List[Tuple[int, int]] = []
                 for qid in cannot_place:
@@ -198,7 +216,7 @@ class DefaultRoutingPlanner:
                         to_meeting_plans.pop(ab[0], None)
                         to_meeting_plans.pop(ab[1], None)
                         fixed_meetings.pop(pkey, None)
-                    replan_current_layer = True  # ★ anderes IN im gleichen Layer probieren
+                    replan_current_layer = True  # anderes IN im gleichen Layer probieren
 
                 # Evakuierung für die restlichen Blocker planen
                 evacuating = {qid: current_pos[qid] for qid in blockers_now if qid in targets}
@@ -234,7 +252,7 @@ class DefaultRoutingPlanner:
                                     to_meeting_plans.pop(ab[0], None)
                                     to_meeting_plans.pop(ab[1], None)
                                     fixed_meetings.pop(pkey, None)
-                                    replan_current_layer = True  # ★ anderes IN probieren
+                                    replan_current_layer = True  # anderes IN probieren
 
                 # === Kollisionen mit wartenden Non-Layer auflösen (Handover-Regel) ===
                 if evac_plans:
@@ -242,15 +260,15 @@ class DefaultRoutingPlanner:
                     evac_plans = DefaultRoutingPlanner._resolve_evacuate_collisions_with_waiters(
                         G=G,
                         evac_plans=evac_plans,
-                        targets={qid: targets[qid] for qid in evacuating},  # Ziele der bewegenden Non-Layer
+                        targets={qid: targets[qid] for qid in evacuating},
                         current_pos=current_pos,
                         waiting_qids=waiting_qids,
-                        blocked_nodes=F_all,               # Layer-Knoten tabu
-                        defective_edges=defective_edges,   # respektiere Defekte
+                        blocked_nodes=F_all,
+                        defective_edges=defective_edges,
                         blocker_to_pair=blocker_to_pair
                     )
 
-            # ★ Falls wir neu planen wollen: springe zum Schleifenanfang (gleiches Layer, neue IN-Wahl)
+            # Falls Replan: gleicher Layer, keine Layergruppe schließen
             if replan_current_layer:
                 replan_counts[idx] = replan_counts.get(idx, 0) + 1
                 if replan_counts[idx] > MAX_REPLANS:
@@ -262,7 +280,9 @@ class DefaultRoutingPlanner:
             if not fixed_meetings:
                 wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
                 batch_plans.append(wait)
+                current_layer_batches.append(wait)  # NEU
                 snapshot_defects(1)
+                _close_current_layer_group()        # NEU
                 idx += 1
                 continue
 
@@ -271,7 +291,7 @@ class DefaultRoutingPlanner:
                 G, defective_edges, p_fail=(1.0 - p_success), p_repair=p_repair
             )
 
-            # Prüfe Non-Layer-Evakuierungspfade: Defekt → betroff. Paar in Spillover (Ausnahme-Fall)
+            # Prüfe Non-Layer-Evakuierungspfade
             if evac_plans:
                 to_spill_for_nonlayer: Set[Tuple[int, int]] = set()
                 for qid, path in evac_plans.items():
@@ -281,7 +301,7 @@ class DefaultRoutingPlanner:
                             to_spill_for_nonlayer.add(ab)
 
                 if to_spill_for_nonlayer:
-                    # ★ Echte Defekte -> direkt Spillover der betroffenen Paare
+                    # echte Defekte -> direkt Spillover der betroffenen Paare
                     for (a, b) in to_spill_for_nonlayer:
                         key = frozenset({a, b})
                         meet = fixed_meetings.get(key)
@@ -290,13 +310,15 @@ class DefaultRoutingPlanner:
                         fixed_meetings.pop(key, None)
                     layers[idx+1:idx+1] = [list(to_spill_for_nonlayer)]
 
-                    # *** Alles-oder-nichts: keine Evakuierung in diesem Microbatch ***
+                    # keine Evakuierung in diesem Microbatch
                     evac_plans.clear()
 
             if not fixed_meetings:
                 wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
                 batch_plans.append(wait)
+                current_layer_batches.append(wait)  # NEU
                 snapshot_defects(1)
+                _close_current_layer_group()        # NEU
                 idx += 1
                 continue
 
@@ -322,14 +344,15 @@ class DefaultRoutingPlanner:
                     if cut:
                         T_pre_sync = max(T_pre_sync, cut[-1][1])
 
-            # ★ bei Replan zurück zum Layer-Anfang
             if replan_current_layer:
                 continue
 
             if not fixed_meetings:
                 wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
                 batch_plans.append(wait)
+                current_layer_batches.append(wait)  # NEU
                 snapshot_defects(1)
+                _close_current_layer_group()        # NEU
                 idx += 1
                 continue
 
@@ -343,7 +366,6 @@ class DefaultRoutingPlanner:
                 pa = pre_in_paths.get(a)
                 pb = pre_in_paths.get(b)
                 if pa is None or pb is None:
-                    # Hier landen wir nicht mehr (würden oben replannen), lassen aber konservativ drin
                     to_spill_layer_defects.append((a, b))
                     continue
                 if DefaultRoutingPlanner._path_uses_defective_edge(pa, defective_edges):
@@ -358,7 +380,7 @@ class DefaultRoutingPlanner:
                     to_spill_layer_defects.append((a, b))
 
             if to_spill_layer_defects:
-                # ★ Ausnahme (Defekte) -> direkt Spillover
+                # Ausnahme (Defekte) -> direkt Spillover
                 for (a, b) in to_spill_layer_defects:
                     key = frozenset({a, b})
                     meet = fixed_meetings.get(key)
@@ -370,7 +392,9 @@ class DefaultRoutingPlanner:
             if not fixed_meetings:
                 wait = {qid: [(current_pos[qid], 0), (current_pos[qid], 1)] for qid in all_qids}
                 batch_plans.append(wait)
+                current_layer_batches.append(wait)  # NEU
                 snapshot_defects(1)
+                _close_current_layer_group()        # NEU
                 idx += 1
                 continue
 
@@ -390,6 +414,7 @@ class DefaultRoutingPlanner:
                 for qid in (all_qids - set(micro_evacuate.keys())):
                     micro_evacuate[qid] = [(current_pos[qid], 0), (current_pos[qid], dur)]
                 batch_plans.append(micro_evacuate)
+                current_layer_batches.append(micro_evacuate)  # NEU
                 snapshot_defects(1)
                 # Positionen aktualisieren
                 for qid in evac_plans:
@@ -416,6 +441,7 @@ class DefaultRoutingPlanner:
             for qid in others:
                 micro_to_pre[qid] = [(current_pos[qid], 0), (current_pos[qid], dur_pre)]
             batch_plans.append(micro_to_pre)
+            current_layer_batches.append(micro_to_pre)  # NEU
             snapshot_defects(1)
 
             # Positionen aktualisieren (Layer stehen nun am PRE-IN)
@@ -444,8 +470,16 @@ class DefaultRoutingPlanner:
             for qid in rest:
                 micro_in[qid] = [(current_pos[qid], 0), (current_pos[qid], 2)]
             batch_plans.append(micro_in)
+            current_layer_batches.append(micro_in)  # NEU
             snapshot_defects(1)
+
+            # *** Layer abgeschlossen ***
+            _close_current_layer_group()  # NEU
+
             idx += 1
+
+        # Seitenkanal speichern
+        DefaultRoutingPlanner.LAST_LAYERED_BATCHES = layered_batches
 
         # Stitchen wie im Default
         return DefaultRoutingPlanner.stitch_batches(qubits, batch_plans, batch_defects)
@@ -469,7 +503,7 @@ class DefaultRoutingPlanner:
           - Einzigartige INs pro Paar
           - Pfade dürfen *keinen* Startknoten eines Layer-Qubits (außer eigenes Start) enthalten
           - Alle PRE-INs im Layer müssen unterschiedlich sein
-          - 🔧 NEU: Pfade dürfen KEINE PRE-INs anderer Layer-Qubits im selben Layer enthalten
+          - Pfade dürfen KEINE PRE-INs anderer Layer-Qubits im selben Layer enthalten
           - Non-Layer werden NICHT berücksichtigt
         """
         res = Reservations(G, blocked_edges=defective_edges)
@@ -480,7 +514,6 @@ class DefaultRoutingPlanner:
         banned_meetings = banned_meetings or {}
         all_ins = all_ins or set()
         exhausted_pairs: List[Tuple[int, int]] = []
-
 
         # Startknoten zum Blockieren in der Suche (außer eigener Start)
         def forbidden_for(qid: int) -> Set[Coord]:
@@ -502,7 +535,7 @@ class DefaultRoutingPlanner:
             qa, qb = current_pos[a], current_pos[b]
             placed = False
 
-            # 🔧 Bereits akzeptierte PRE-INs anderer Layer-Qubits sammeln
+            # Bereits akzeptierte PRE-INs anderer Layer-Qubits sammeln
             cur_preins_map = DefaultRoutingPlanner._preins_for_plans(plans, fixed_meetings)
             existing_preins: Set[Coord] = set(cur_preins_map.values()) if cur_preins_map else set()
 
@@ -526,7 +559,7 @@ class DefaultRoutingPlanner:
                 # Suche kollisionsfrei (nur Layer) bis zum Meeting
                 res_try = deepcopy(res)
 
-                # 🔧 PRE-INs anderer bereits gesetzter Layer-Qubits blockieren
+                # PRE-INs anderer bereits gesetzter Layer-Qubits blockieren
                 if existing_preins:
                     DefaultRoutingPlanner._block_nodes(res_try, existing_preins)
 
@@ -537,11 +570,10 @@ class DefaultRoutingPlanner:
                     continue
                 Reservations.commit(res_try, pa)
 
-                # >>> NEU: pre_a sofort bestimmen und blockieren
+                # pre_a bestimmen und blockieren
                 pre_a = DefaultRoutingPlanner._entry_sn_from_path(pa, meet)
                 if pre_a is None:
                     continue
-
                 if pre_a in existing_path_nodes:
                     continue
                 DefaultRoutingPlanner._block_nodes(res_try, {pre_a})
@@ -560,7 +592,6 @@ class DefaultRoutingPlanner:
                 pre_b = DefaultRoutingPlanner._entry_sn_from_path(pb, meet)
                 if pre_b is None:
                     continue
-
                 if pre_b in existing_path_nodes:
                     continue
 
@@ -574,7 +605,7 @@ class DefaultRoutingPlanner:
                 if len(set(prein_vals)) != len(prein_vals):
                     continue
 
-                # >>> WICHTIG: auch B reservieren (fehlte bisher in deinem Codepfad)
+                # Auch B reservieren
                 Reservations.commit(res_try, pb)
 
                 # akzeptieren
@@ -584,7 +615,6 @@ class DefaultRoutingPlanner:
                 reserved_in.add(meet)
                 placed = True
                 break
-
 
             if not placed:
                 unplaceable.append((a, b))
@@ -685,7 +715,6 @@ class DefaultRoutingPlanner:
         """Liefert Liste von Paaren, deren PRE-IN Eindeutigkeit bricht."""
         pre = DefaultRoutingPlanner._preins_for_plans(plans, fixed_meetings)
         if pre is None:
-            # alle Paare potenziell betroffen
             return [tuple(sorted(k)) for k in fixed_meetings.keys()]  # type: ignore
         seen: Dict[Coord, int] = {}
         conflicts: Set[Tuple[int, int]] = set()
@@ -697,7 +726,6 @@ class DefaultRoutingPlanner:
                     conflicts.add(tuple(sorted((qid, seen[pin]))))
                 else:
                     seen[pin] = qid
-        # Konflikte auf Paare mappen: grob/konservativ – jedes Paar, dessen Qubit beteiligt ist
         bad_pairs: Set[Tuple[int, int]] = set()
         for (x, y) in conflicts:
             for pair_key in fixed_meetings.keys():
@@ -870,7 +898,7 @@ class DefaultRoutingPlanner:
                         chain.append(bqid)
                         seen.add(bqid)
 
-                        # ★ WICHTIG: Paar-Zuordnung des Movers auf den Blocker übertragen
+                        # Paar-Zuordnung des Movers auf den Blocker übertragen
                         if root_pair is not None:
                             blocker_to_pair.setdefault(bqid, root_pair)
 
@@ -882,7 +910,7 @@ class DefaultRoutingPlanner:
             changed = False
 
             # Iteriere über eine Momentaufnahme, da wir 'plans' modifizieren könnten
-            for mover_qid, mover_path in plans.items():
+            for mover_qid, mover_path in list(plans.items()):
                 root_pair = blocker_to_pair.get(mover_qid)
                 # Finde Blocker entlang des Mover-Pfads (in Reihenfolge des Auftretens)
                 chain_blockers = build_blocker_chain_along_path(mover_path, root_pair)
@@ -890,15 +918,13 @@ class DefaultRoutingPlanner:
                     continue
 
                 # --- Versuche: Replan für das *gesamte* Evakuierungsset + Chain-Blocker ---
-                                # --- Versuche: Replan für das *gesamte* Evakuierungsset + Chain-Blocker ---
-                # Plan the union of current movers and chain blockers, but only if each has a target.
                 chain_agents: List[int] = [mover_qid] + chain_blockers
                 agents_to_plan: Set[int] = set(plans.keys()) | set(chain_blockers)
 
-                # Starts for all agents we intend to plan now
+                # Starts für alle zu planenden Agents
                 starts: Dict[int, Coord] = {qid: current_pos[qid] for qid in agents_to_plan}
 
-                # Base targets: whatever we already have for those agents
+                # Basisziele: vorhandene Ziele
                 new_targets_full: Dict[int, Coord] = {
                     qid: targets_local[qid] for qid in agents_to_plan if qid in targets_local
                 }
@@ -916,7 +942,7 @@ class DefaultRoutingPlanner:
                             valid_chain = False
                             break
 
-                # Every agent we plan must have a target (avoids KeyError downstream)
+                # Alle müssen ein Ziel haben
                 if valid_chain and agents_to_plan.issubset(new_targets_full.keys()):
                     try:
                         replanned = DefaultRoutingPlanner._mapf_to_targets(
@@ -926,12 +952,12 @@ class DefaultRoutingPlanner:
                             blocked_nodes=blocked_nodes,
                             blocked_edges=defective_edges,
                         )
-                        # Success: update plans and persist the targets for these agents
+                        # Success
                         for qid, path in replanned.items():
                             plans[qid] = path
                             targets_local[qid] = new_targets_full[qid]
 
-                        # Chain blockers are no longer "waiting"
+                        # Chain-Blocker sind nicht mehr wartend
                         for bqid in chain_blockers:
                             wait_pos.pop(bqid, None)
 
@@ -939,7 +965,7 @@ class DefaultRoutingPlanner:
                         break
 
                     except RuntimeError:
-                        # Fallback: simple two-agent handover (mover <-> first blocker)
+                        # Fallback: einfacher Handover zwischen mover und erstem Blocker
                         b1 = chain_blockers[0]
                         try:
                             partial = DefaultRoutingPlanner._mapf_to_targets(
@@ -951,7 +977,6 @@ class DefaultRoutingPlanner:
                             )
                             plans[mover_qid] = partial[mover_qid]
                             plans[b1] = partial[b1]
-                            # Persist targets for both so future iterations remain consistent
                             targets_local[mover_qid] = current_pos[b1]
                             targets_local[b1] = targets_local.get(mover_qid, current_pos[b1])
 
@@ -1046,8 +1071,313 @@ class DefaultRoutingPlanner:
             print(f"[Layer {layer_idx}] Keine Meeting-INs fixiert.")
             return
         print(f"[Layer {layer_idx}] Fixierte Meeting-INs:")
-        # Stabil und lesbar: Paare sortiert ausgeben
         for pair_key in sorted(fixed_meetings.keys(), key=lambda k: tuple(sorted(k))):
             a, b = sorted(pair_key)
             meet = fixed_meetings[pair_key]
             print(f"  Paar ({a}, {b}) -> IN {meet}")
+
+
+# evaluate_rotation_vs_default.py
+
+import sys
+import time
+import random
+from typing import Dict, List, Tuple, Set, Optional
+
+import numpy as np
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# ---- Imports from your codebase ----
+from routing.common import Qubit, TimedNode
+from routing.network import NetworkBuilder
+
+from routing.default_routing import DefaultRoutingPlanner as _DefaultRoutingPlanner
+from routing.rotation_routing import RotationRoutingPlanner as _RotationRoutingPlanner
+
+
+# ========== Monkey-patch: add LAST_TELEPORTATIONS side-channel to planners ==========
+
+def _instrument_default_route():
+    orig_route = _DefaultRoutingPlanner.route
+
+    def capturing_route(*args, **kwargs):
+        batches_collector = {"batches": None}
+        orig_stitch = _DefaultRoutingPlanner.stitch_batches
+
+        def capturing_stitch(qubits, batch_plans, batch_defects=None):
+            batches_collector["batches"] = batch_plans
+            return orig_stitch(qubits, batch_plans, batch_defects)
+
+        _DefaultRoutingPlanner.stitch_batches = staticmethod(capturing_stitch)
+        try:
+            timelines, edge_timebands = orig_route(*args, **kwargs)
+        finally:
+            _DefaultRoutingPlanner.stitch_batches = staticmethod(orig_stitch)
+
+        # --- Teleportationszählung (bevorzugt echte Layerstruktur vom Planner) ---
+        tele = 0
+        layered = getattr(_DefaultRoutingPlanner, "LAST_LAYERED_BATCHES", None)
+
+        if isinstance(layered, list) and layered and isinstance(layered[0], list):
+            # Pro Layer: Menge bewegter Qubits (mind. 1 Schritt in irgendeinem Microbatch)
+            for layer in layered:
+                moved_in_layer: Set[int] = set()
+                for plans in layer:  # plans: Dict[qid -> path]
+                    for qid, path in plans.items():
+                        if any(c1 != c2 for (c1, _), (c2, _) in zip(path[:-1], path[1:])):
+                            moved_in_layer.add(qid)
+                tele += len(moved_in_layer)
+        else:
+            # Fallback: flache Struktur → als EIN Layer interpretieren (konservativ)
+            batch_plans = batches_collector["batches"]
+            if batch_plans is None:
+                moved_qids = set()
+                for qid, path in timelines.items():
+                    if any(c1 != c2 for (c1, _), (c2, _) in zip(path[:-1], path[1:])):
+                        moved_qids.add(qid)
+                tele = len(moved_qids)
+            else:
+                moved_qids = set()
+                for plans in batch_plans:
+                    for qid, path in plans.items():
+                        if any(c1 != c2 for (c1, _), (c2, _) in zip(path[:-1], path[1:])):
+                            moved_qids.add(qid)
+                tele = len(moved_qids)
+
+        _DefaultRoutingPlanner.LAST_TELEPORTATIONS = int(tele)
+        return timelines, edge_timebands
+
+    _DefaultRoutingPlanner.route = staticmethod(capturing_route)
+
+
+
+# Install instrumentation
+_instrument_default_route()
+
+
+
+def count_movements(timelines: Dict[int, List[TimedNode]]) -> int:
+    moves = 0
+    for path in timelines.values():
+        for (c1, _t1), (c2, _t2) in zip(path[:-1], path[1:]):
+            if c1 != c2:
+                moves += 1
+    return moves
+
+
+def total_timesteps(timelines: Dict[int, List[TimedNode]]) -> int:
+    max_t = 0
+    for path in timelines.values():
+        if path:
+            max_t = max(max_t, path[-1][1])
+    return max_t
+
+
+def run_one(
+    algo_name: str,
+    G: nx.Graph,
+    qubits: List[Qubit],
+    pairs: List[Tuple[Qubit, Qubit]],
+    p_success: float,
+    p_repair: float,
+):
+    if algo_name == "Rotation":
+        Planner = _RotationRoutingPlanner
+    elif algo_name == "Default":
+        Planner = _DefaultRoutingPlanner
+    else:
+        raise ValueError(algo_name)
+
+    start = time.perf_counter()
+    timelines, _ = Planner.route(G, qubits, pairs, p_success=p_success, p_repair=p_repair)
+    end = time.perf_counter()
+
+    movements = count_movements(timelines)
+    timesteps = total_timesteps(timelines)
+    runtime_s = end - start
+
+    if hasattr(Planner, "LAST_TELEPORTATIONS") and Planner.LAST_TELEPORTATIONS is not None:
+        num_tp = int(getattr(Planner, "LAST_TELEPORTATIONS"))
+    else:
+        num_tp = movements
+
+    return {
+        "movements": movements,
+        "timesteps": timesteps,
+        "runtime_s": runtime_s,
+        "exception": 0,
+        "num_of_teleportations": num_tp,
+    }
+
+
+def evaluate_rotation_vs_default(
+    sizes: List[Tuple[int, int]] = [(2,2), (3,3), (4,4)],
+    rounds: int = 20,
+    base_seed: int = 42,
+    n_seed_samples: int = 1,
+    p_success: float = 1.0,
+    p_repair: float = 1.0,
+) -> pd.DataFrame:
+    records = []
+
+    # --- Fortschrittsberechnung vorbereiten ---
+    total_runs = 0
+    for (w, h) in sizes:
+        G = NetworkBuilder.build_network(w, h)
+        in_nodes = [n for n in G.nodes if G.nodes[n].get("type") == "IN"]
+        max_qubits = max(2, len(in_nodes))
+        total_runs += (max_qubits - 1) * n_seed_samples * 2  # 2 algos
+    done_runs = 0
+
+    for (w, h) in sizes:
+        print(f"\n=== Evaluating grid {w}x{h} ===")
+        G = NetworkBuilder.build_network(w, h)
+        in_nodes = [n for n in G.nodes if G.nodes[n].get("type") == "IN"]
+        max_qubits = max(2, len(in_nodes))
+
+        for n_qubits in range(2, max_qubits + 1):
+            for seed_offset in range(n_seed_samples):
+                seed = base_seed + seed_offset
+
+                try:
+                    G, qubits, pairs = NetworkBuilder.place_qubits_and_make_pairs(
+                        width=w,
+                        height=h,
+                        n_qubits=n_qubits,
+                        rounds=rounds,
+                        seed=seed,
+                    )
+                except Exception as e:
+                    print(f"[WARN] Skip {w}x{h}, n_qubits={n_qubits}, seed={seed}: {e}")
+                    continue
+
+                for algo_name in ("Rotation", "Default"):
+                    done_runs += 1
+                    percent = 100.0 * done_runs / total_runs
+                    label = f"[{percent:5.1f}%] ({done_runs}/{total_runs})"
+                    print(f"  {label} Grid={w}x{h}, n_qubits={n_qubits}, seed={seed}, algo={algo_name} ... ", end="")
+                    sys.stdout.flush()
+
+                    try:
+                        m = run_one(algo_name, G, qubits, pairs, p_success, p_repair)
+                        status = "OK"
+                    except Exception as e:
+                        m = {"movements": np.nan, "timesteps": np.nan, "runtime_s": np.nan,
+                            "exception": 1, "num_of_teleportations": np.nan}
+                        status = f"FAIL ({type(e).__name__})"
+                    records.append({
+                        "algo": algo_name,
+                        "width": w,
+                        "height": h,
+                        "n_qubits": n_qubits,
+                        "rounds": rounds,
+                        "seed": seed,
+                        **m
+                    })
+                    print(status)
+
+    df = pd.DataFrame.from_records(records)
+    print(f"\nEvaluation complete: {done_runs} runs total.")
+    return df
+
+
+
+def summarize(df: pd.DataFrame) -> pd.DataFrame:
+    group_cols = ["width", "height", "algo", "n_qubits"]
+    metrics = ["movements", "timesteps", "runtime_s", "exception", "num_of_teleportations"]
+    out = (
+        df.groupby(group_cols, as_index=False)[metrics]
+          .mean(numeric_only=True)
+          .sort_values(group_cols)
+    )
+    return out
+
+
+def make_plots(df: pd.DataFrame, out_prefix: str = "rotdef") -> None:
+    """Create per-grid line plots vs n_qubits for all metrics, one chart per metric.
+    Files:
+      {out_prefix}_{w}x{h}_movements.png
+      {out_prefix}_{w}x{h}_timesteps.png
+      {out_prefix}_{w}x{h}_runtime.png
+      {out_prefix}_{w}x{h}_exception_rate.png
+      {out_prefix}_{w}x{h}_teleportations.png
+    """
+    group_cols = ["width", "height", "algo", "n_qubits"]
+    agg = (
+        df.groupby(group_cols, as_index=False)
+          .agg({
+              "movements": "mean",
+              "timesteps": "mean",
+              "runtime_s": "mean",
+              "exception": "mean",
+              "num_of_teleportations": "mean",
+          })
+          .sort_values(group_cols)
+    )
+
+    grids = (
+        agg[["width", "height"]]
+        .drop_duplicates()
+        .sort_values(["width", "height"])
+        .itertuples(index=False, name=None)
+    )
+
+    for (w, h) in grids:
+        sub = agg[(agg["width"] == w) & (agg["height"] == h)]
+        if sub.empty:
+            continue
+
+        def _plot_metric(metric: str, y_label: str, title: str, filename: str):
+            plt.figure()
+            for algo in sorted(sub["algo"].unique()):
+                ss = sub[sub["algo"] == algo]
+                plt.plot(ss["n_qubits"], ss[metric], marker="o", label=algo)
+            plt.xlabel("n_qubits")
+            plt.ylabel(y_label)
+            plt.title(title)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(filename, dpi=150)
+            plt.close()
+
+        _plot_metric("movements", "mean movements",
+                     f"Mean movements vs n_qubits ({w}x{h})",
+                     f"{out_prefix}_{w}x{h}_movements.png")
+        _plot_metric("timesteps", "mean timesteps",
+                     f"Mean timesteps vs n_qubits ({w}x{h})",
+                     f"{out_prefix}_{w}x{h}_timesteps.png")
+        _plot_metric("runtime_s", "mean runtime (s)",
+                     f"Mean runtime vs n_qubits ({w}x{h})",
+                     f"{out_prefix}_{w}x{h}_runtime.png")
+        _plot_metric("exception", "exception rate",
+                     f"Exception rate vs n_qubits ({w}x{h})",
+                     f"{out_prefix}_{w}x{h}_exception_rate.png")
+        _plot_metric("num_of_teleportations", "mean num_of_teleportations",
+                     f"Mean teleportations vs n_qubits ({w}x{h})",
+                     f"{out_prefix}_{w}x{h}_teleportations.png")
+
+
+def main():
+    df = evaluate_rotation_vs_default (
+        sizes=[(2,2), (3,3), (4,4)],
+        rounds=5,
+        base_seed=42,
+        n_seed_samples=20,
+        p_success=1.0,
+        p_repair = 1.0,
+    )
+    df.to_csv("rotation_vs_default_results.csv", index=False)
+
+    summary = summarize(df)
+    summary.to_csv("rotation_vs_default_summary.csv", index=False)
+
+    # Make plots for all metrics
+    make_plots(df, out_prefix="rotdef")
+
+    print("\nSaved: rotation_vs_default_results.csv, rotation_vs_default_summary.csv, and plots rotdef_* .png")
+
+
+if __name__ == "__main__":
+    main()

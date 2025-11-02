@@ -6,18 +6,32 @@ import networkx as nx
 from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubit
 from routing.default_routing import DefaultRoutingPlanner
 
-P_SUCCESS = 0.98
+P_SUCCESS = 1.0
 P_REPAIR = 0.9
 
 
-class SequentialDiamondRoutingPlanner:
+class RotationRoutingPlanner:
     """
-    Führt Paare nacheinander (ohne Layerbildung) aus – jetzt mit defekten Kanten:
+    Führt Paare nacheinander (ohne Layerbildung) aus – jetzt mit defekten Kanten, und mit
+    strikter Trennung der Knotentypen:
+
+    - Qubits bewegen sich ausschließlich auf SN-Knoten.
+    - IN-Knoten dürfen nur für die Interaktion (Meeting-Node) betreten werden:
+        synchroner Hop PRE-IN -> IN (Sampling AN), danach synchron IN -> PRE-IN (Sampling AUS).
     - Direkt vor jedem Tick werden Defekte gesampelt (p_success, p_repair),
       ABER beim Schritt vom IN (Meeting-Node) zurück zum PRE-IN wird NICHT gesampelt.
     - Wenn irgendein geplanter Schritt in diesem Tick eine defekte Kante benutzen würde,
       wird in diesem Tick kein Qubit bewegt (Wartetick).
     - Bewegungen eines Ticks werden atomisch betrachtet (alle geplanten Moves + Rotationen).
+
+    WICHTIG:
+    - Pfade zu PRE-IN werden ausschließlich im SN-Subgraphen geplant. Der PRE-IN ist
+      ein SN-Nachbar des gewählten Meeting-IN.
+    - Nebenbedingung: Pfade der Paar-Qubits vermeiden alle SN-Rauten-Kanten, in deren Raute
+      sich das jeweils andere Paar-Qubit aktuell befindet (IN-Hops ausgenommen).
+    - Meeting-Kandidaten werden nach minimaler Gesamtdistanz (A→best PRE + B→best PRE, mit Avoidance)
+      sortiert geprüft.
+    - NEU: Pro Tick wird höchstens EINE Raute rotiert (sequentielle Rotationen).
     """
 
     @staticmethod
@@ -42,9 +56,15 @@ class SequentialDiamondRoutingPlanner:
         defective_edges: Set[frozenset] = set()
         edge_timebands: List[Tuple[int, int, Set[frozenset]]] = []
 
+        # ---------- Knotentyp-Checks ----------
+        def _is_sn(n: Coord) -> bool:
+            return G.nodes[n].get("type") == "SN"
+
+        def _is_in(n: Coord) -> bool:
+            return G.nodes[n].get("type") == "IN"
+
         # ---------- Defekt-Sampling & Tick-Handling ----------
         def _sample_edge_failures():
-            """Analog zum Default: pro Tick Ausfall/Reparatur sampeln."""
             for u, v in G.edges():
                 e = frozenset({u, v})
                 if e in defective_edges:
@@ -55,36 +75,24 @@ class SequentialDiamondRoutingPlanner:
                         defective_edges.add(e)
 
         def _pending_updates_would_use_defect(pending_updates: Dict[int, Coord]) -> bool:
-            """Prüft, ob irgendein geplanter Schritt (u->v) eine defekte Kante benutzen würde."""
             for qid, newp in pending_updates.items():
                 u = current_pos[qid]
                 v = newp
-                if u != v:
-                    if frozenset({u, v}) in defective_edges:
-                        return True
+                if u != v and frozenset({u, v}) in defective_edges:
+                    return True
             return False
 
         def _attempt_tick(pending_updates: Dict[int, Coord], *, sample: bool = True) -> bool:
-            """
-            Ein *Tick*:
-              1) (Optional) Defekte jetzt sampeln – maßgeblich für diesen Tick,
-              2) geplante Bewegungen atomisch anwenden, wenn keine defekte Kante betroffen,
-              3) Zeit fortschreiben, Positionen & Defekte protokollieren.
-            Rückgabe: True, wenn Moves angewandt wurden (sonst Wartetick).
-            """
             nonlocal t
-            # 1) frisch samplen (falls gewünscht)
             if sample:
                 _sample_edge_failures()
 
             moved = False
-            # 2) atomische Prüfung & Anwendung
             if pending_updates and not _pending_updates_would_use_defect(pending_updates):
                 for qid, newp in pending_updates.items():
                     current_pos[qid] = newp
                 moved = True
 
-            # 3) t vor, Positionen & Zeitband loggen (immer loggen, auch bei sample=False)
             t += 1
             for qid in all_qids:
                 last = timelines[qid][-1]
@@ -94,30 +102,20 @@ class SequentialDiamondRoutingPlanner:
             edge_timebands.append((t - 1, t, set(defective_edges)))
             return moved
 
-        def append_all_positions():
-            """Positionen für *aktuellen* t in die Timelines schreiben (ohne Tick)."""
-            for qid in all_qids:
-                last = timelines[qid][-1]
-                cur = (current_pos[qid], t)
-                if last != cur:
-                    timelines[qid].append(cur)
-
-        # ---------- Raute-/Rotations-Helfer ----------
-        def _is_sn(n: Coord) -> bool:
-            return G.nodes[n].get("type") == "SN"
-
+        # ---------- Raute-/Rotations-Helfer (nur auf SN-Knoten) ----------
         def _is_diagonal(u: Coord, v: Coord) -> bool:
             return abs(u[0] - v[0]) == 1 and abs(u[1] - v[1]) == 1
 
         def _diag_sn_neighbors(n: Coord) -> List[Coord]:
             out: List[Coord] = []
+            if not _is_sn(n):
+                return out
             for w in G.neighbors(n):
                 if _is_sn(w) and _is_diagonal(n, w):
                     out.append(w)
             return out
 
         def _diamond_for_edge(u: Coord, v: Coord) -> Optional[List[Coord]]:
-            """Liefert die vier SN-Knoten der Raute in Umlaufrichtung [u, v, x, w]."""
             if not (_is_sn(u) and _is_sn(v) and _is_diagonal(u, v)):
                 return None
             Su = [w for w in _diag_sn_neighbors(u) if w != v]
@@ -129,7 +127,6 @@ class SequentialDiamondRoutingPlanner:
             return None
 
         def _rotation_direction(diamond: List[Coord], u: Coord, v: Coord) -> int:
-            """+1 = Uhrzeigersinn entlang [u->v->x->w->u], sonst -1."""
             i = diamond.index(u)
             return +1 if diamond[(i + 1) % 4] == v else -1
 
@@ -138,10 +135,6 @@ class SequentialDiamondRoutingPlanner:
             direction: int,
             exclude: Set[int],
         ) -> Dict[int, Coord]:
-            """
-            Liefert neue Positionen der rotierenden Qubits auf der Raute
-            (ohne sie anzuwenden). 'exclude' werden nicht bewegt.
-            """
             idx_of = {p: i for i, p in enumerate(diamond)}
             updates: Dict[int, Coord] = {}
             for qid, pos in current_pos.items():
@@ -153,7 +146,7 @@ class SequentialDiamondRoutingPlanner:
                     updates[qid] = diamond[ni]
             return updates
 
-        # ---- Helfer: gemeinsame Raute & Ausweich-Schritt ----
+        # ---- Helfer: gemeinsame Raute & Ausweich-Schritt (nur SN) ----
         def _shared_diamond(n1: Coord, n2: Coord) -> Optional[List[Coord]]:
             if not (_is_sn(n1) and _is_sn(n2)):
                 return None
@@ -164,7 +157,6 @@ class SequentialDiamondRoutingPlanner:
             return None
 
         def _diamonds_at_node(n: Coord) -> List[List[Coord]]:
-            """Alle Rauten (4er-Zyklen), an denen n beteiligt ist."""
             out: List[List[Coord]] = []
             if not _is_sn(n):
                 return out
@@ -182,10 +174,6 @@ class SequentialDiamondRoutingPlanner:
         def _escape_step_along_other_diamond(
             node: Coord, other: Coord
         ) -> Optional[Tuple[Coord, List[Coord], int]]:
-            """
-            Bewege 'node' entlang einer Diagonalkante einer Raute, die 'other' NICHT enthält.
-            Liefert (v, diamond, direction) oder None.
-            """
             Ds = _diamonds_at_node(node)
             Ds = [D for D in Ds if other not in D]
             if not Ds:
@@ -200,19 +188,54 @@ class SequentialDiamondRoutingPlanner:
                     return (v, D, direction)
             return None
 
-        # ---------- Pfad-Helfer ----------
-        def _shortest_path_nodes(src: Coord, dst: Coord) -> List[Coord]:
-            """Einfacher kürzester Pfad auf G (knotenweise)."""
-            return nx.shortest_path(G, src, dst)
+        # ---------- Pfad-Helfer: ausschließlich SN-Subgraph ----------
+        sn_nodes = [n for n in G.nodes() if _is_sn(n)]
+        SN = G.subgraph(sn_nodes).copy()
 
-        def _entry_sn_from_path_nodes(path_nodes: List[Coord], meeting: Coord) -> Optional[Coord]:
-            """PRE-IN ermitteln (Knoten direkt vor meeting in path_nodes)."""
-            if meeting not in path_nodes:
+        def _shortest_path_sn(src: Coord, dst: Coord) -> List[Coord]:
+            return nx.shortest_path(SN, src, dst)
+
+        def _sn_neighbors_of_meet(meeting: Coord) -> List[Coord]:
+            if not _is_in(meeting):
+                return []
+            return [w for w in G.neighbors(meeting) if _is_sn(w)]
+
+        # ---------- Avoidance (verbotene Kanten wg. Raute des anderen Paar-Qubits) ----------
+        def _diamond_edges(diamond: List[Coord]) -> Set[frozenset]:
+            return {
+                frozenset({diamond[i], diamond[(i + 1) % 4]})
+                for i in range(4)
+            }
+
+        def _forbidden_edges_due_to(other_pos: Coord) -> Set[frozenset]:
+            forb: Set[frozenset] = set()
+            for D in _diamonds_at_node(other_pos):
+                forb |= _diamond_edges(D)
+            return forb
+
+        def _shortest_path_sn_avoiding(src: Coord, dst: Coord, forbidden: Set[frozenset]) -> Optional[List[Coord]]:
+            H = SN.copy()
+            to_remove = []
+            for u, v in H.edges():
+                if frozenset({u, v}) in forbidden:
+                    to_remove.append((u, v))
+            H.remove_edges_from(to_remove)
+            try:
+                return nx.shortest_path(H, src, dst)
+            except nx.NetworkXNoPath:
                 return None
-            k = path_nodes.index(meeting)
-            if k == 0:
-                return None
-            return path_nodes[k - 1]
+
+        # ---------- Distanzschätzer für Meeting-Sortierung ----------
+        def _min_sn_distance_to_any_pre(meeting: Coord, src: Coord, forbidden: Set[frozenset]) -> Optional[int]:
+            best: Optional[int] = None
+            for pre in _sn_neighbors_of_meet(meeting):
+                path = _shortest_path_sn_avoiding(src, pre, forbidden)
+                if path is None:
+                    continue
+                d = max(0, len(path) - 1)
+                if best is None or d < best:
+                    best = d
+            return best
 
         # ---------- Hauptschleife über Paare ----------
         for qa, qb in pairs:
@@ -220,38 +243,70 @@ class SequentialDiamondRoutingPlanner:
             pa = current_pos[a]
             pb = current_pos[b]
 
+            if not _is_sn(pa) or not _is_sn(pb):
+                _attempt_tick({})
+                continue
+
             cands = DefaultRoutingPlanner._best_meeting_candidates(
                 G, pa, pb, reserved=set(), forbidden_nodes=set()
             )
-            meet: Optional[Coord] = None
-            pathA: Optional[List[Coord]] = None
-            pathB: Optional[List[Coord]] = None
 
+            meet: Optional[Coord] = None
+            preA: Optional[Coord] = None
+            preB: Optional[Coord] = None
+            pathA_to_pre: Optional[List[Coord]] = None
+            pathB_to_pre: Optional[List[Coord]] = None
+
+            forb_for_A = _forbidden_edges_due_to(pb)
+            forb_for_B = _forbidden_edges_due_to(pa)
+
+            # Sortiere Meetings nach minimaler Gesamtdistanz (Avoidance)
+            scored: List[Tuple[float, Coord]] = []
             for m in cands:
-                try:
-                    pA = _shortest_path_nodes(pa, m)
-                    pB = _shortest_path_nodes(pb, m)
-                    meet = m
-                    pathA = pA
-                    pathB = pB
-                    break
-                except nx.NetworkXNoPath:
+                if not _is_in(m):
+                    continue
+                da = _min_sn_distance_to_any_pre(m, pa, forb_for_A)
+                db = _min_sn_distance_to_any_pre(m, pb, forb_for_B)
+                scored.append(((float("inf") if da is None or db is None else da + db), m))
+            cands_sorted = [m for _, m in sorted(scored, key=lambda x: x[0])]
+
+            # Wähle erstes Meeting mit gültigen Avoidance-Pfaden
+            for m in cands_sorted:
+                if not _is_in(m):
                     continue
 
-            if meet is None or pathA is None or pathB is None:
+                bestA: Optional[Tuple[Coord, List[Coord]]] = None
+                for pre in _sn_neighbors_of_meet(m):
+                    p = _shortest_path_sn_avoiding(pa, pre, forb_for_A)
+                    if p is None:
+                        continue
+                    if bestA is None or len(p) < len(bestA[1]):
+                        bestA = (pre, p)
+                if bestA is None:
+                    continue
+
+                bestB: Optional[Tuple[Coord, List[Coord]]] = None
+                for pre in _sn_neighbors_of_meet(m):
+                    p = _shortest_path_sn_avoiding(pb, pre, forb_for_B)
+                    if p is None:
+                        continue
+                    if bestB is None or len(p) < len(bestB[1]):
+                        bestB = (pre, p)
+                if bestB is None:
+                    continue
+
+                meet = m
+                preA, pathA_to_pre = bestA
+                preB, pathB_to_pre = bestB
+                break
+
+            if meet is None or preA is None or preB is None or pathA_to_pre is None or pathB_to_pre is None:
                 _attempt_tick({})
                 continue
 
-            preA = _entry_sn_from_path_nodes(pathA, meet)
-            preB = _entry_sn_from_path_nodes(pathB, meet)
-            if preA is None or preB is None:
-                _attempt_tick({})
-                continue
-
-            # --- Vorab-Ausweichschritt, wenn beide auf derselben Raute stehen (und noch nicht am PRE-IN) ---
+            # --- Vorab-Ausweichschritt, falls beide auf derselben Raute stehen ---
             shared = _shared_diamond(pa, pb)
             if shared is not None and not (pa == preA and pb == preB):
-                # deterministisch bevorzugt: b bewegen, sonst a
                 esc_b = _escape_step_along_other_diamond(pb, pa)
                 esc_a = _escape_step_along_other_diamond(pa, pb)
 
@@ -267,63 +322,105 @@ class SequentialDiamondRoutingPlanner:
                 if move_choice is not None:
                     v, dmd, direction = move_choice
                     pending_updates: Dict[int, Coord] = {}
-                    # Rotationen auf der Raute (andere Qubits), beide Paar-Qubits ausgeschlossen
                     rot = _compute_diamond_rotation_updates(dmd, direction, exclude={a, b})
                     pending_updates.update(rot)
                     pending_updates[mover_id] = v
-
-                    # Atomischer Tick mit (hier) Sampling aktiv
                     _attempt_tick(pending_updates, sample=True)
 
-                    # Pfade zum GLEICHEN Meeting neu berechnen
-                    try:
-                        pathA = _shortest_path_nodes(current_pos[a], meet)
-                        pathB = _shortest_path_nodes(current_pos[b], meet)
-                    except nx.NetworkXNoPath:
+                    forb_for_A = _forbidden_edges_due_to(current_pos[b])
+                    forb_for_B = _forbidden_edges_due_to(current_pos[a])
+                    pathA_to_pre = _shortest_path_sn_avoiding(current_pos[a], preA, forb_for_A)
+                    pathB_to_pre = _shortest_path_sn_avoiding(current_pos[b], preB, forb_for_B)
+                    if pathA_to_pre is None or pathB_to_pre is None:
                         _attempt_tick({})
                         continue
-                    preA = _entry_sn_from_path_nodes(pathA, meet)
-                    preB = _entry_sn_from_path_nodes(pathB, meet)
-                    if preA is None or preB is None:
-                        _attempt_tick({})
-                        continue
-
-            # --- Pfade bis PRE-IN (inklusive Start, inklusive PRE-IN)
-            pathA_to_pre = pathA[: pathA.index(meet)]
-            pathB_to_pre = pathB[: pathB.index(meet)]
 
             # --- Schrittweise Ausführung bis beide PRE-IN erreicht ---
-            idxA = 0
-            idxB = 0
+            def _ensure_path_contains_pos_or_replan(
+                who_id: int,
+                cur_path: List[Coord],
+                dst_pre: Coord,
+                forbidden: Set[frozenset],
+            ) -> Tuple[List[Coord], int, bool]:
+                pos = current_pos[who_id]
+                if pos in cur_path:
+                    return cur_path, cur_path.index(pos), False
+                newp = _shortest_path_sn_avoiding(pos, dst_pre, forbidden)
+                if newp is None:
+                    return cur_path, 0, True
+                return newp, 0, True
+
+            forb_for_A = _forbidden_edges_due_to(current_pos[b])
+            forb_for_B = _forbidden_edges_due_to(current_pos[a])
+            pathA_to_pre, idxA, replA = _ensure_path_contains_pos_or_replan(a, pathA_to_pre, preA, forb_for_A)
+            pathB_to_pre, idxB, replB = _ensure_path_contains_pos_or_replan(b, pathB_to_pre, preB, forb_for_B)
+            if (replA and current_pos[a] not in pathA_to_pre) or (replB and current_pos[b] not in pathB_to_pre):
+                _attempt_tick({})
+                continue
+
+            idxA = max(0, min(idxA, len(pathA_to_pre) - 1))
+            idxB = max(0, min(idxB, len(pathB_to_pre) - 1))
 
             while (current_pos[a] != preA) or (current_pos[b] != preB):
                 pending_updates: Dict[int, Coord] = {}
 
-                # Vorschlag für A in diesem Tick
+                # --- Kandidat A vorbereiten ---
+                rotA: Dict[int, Coord] = {}
+                vA: Optional[Coord] = None
                 if current_pos[a] != preA and idxA + 1 < len(pathA_to_pre):
                     uA = pathA_to_pre[idxA]
                     vA = pathA_to_pre[idxA + 1]
-                    diamondA = _diamond_for_edge(uA, vA)
-                    if diamondA is not None:
-                        dirA = _rotation_direction(diamondA, uA, vA)
-                        rotA = _compute_diamond_rotation_updates(diamondA, dirA, exclude={a})
-                        pending_updates.update(rotA)
-                    pending_updates[a] = vA
-
-                # Vorschlag für B in diesem Tick
+                    if _is_sn(uA) and _is_sn(vA):
+                        diamondA = _diamond_for_edge(uA, vA)
+                        if diamondA is not None:
+                            dirA = _rotation_direction(diamondA, uA, vA)
+                            rotA = _compute_diamond_rotation_updates(diamondA, dirA, exclude={a})
+                # --- Kandidat B vorbereiten ---
+                rotB: Dict[int, Coord] = {}
+                vB: Optional[Coord] = None
                 if current_pos[b] != preB and idxB + 1 < len(pathB_to_pre):
                     uB = pathB_to_pre[idxB]
                     vB = pathB_to_pre[idxB + 1]
-                    diamondB = _diamond_for_edge(uB, vB)
-                    if diamondB is not None:
-                        dirB = _rotation_direction(diamondB, uB, vB)
-                        rotB = _compute_diamond_rotation_updates(diamondB, dirB, exclude={b})
-                        pending_updates.update(rotB)
-                    pending_updates[b] = vB
+                    if _is_sn(uB) and _is_sn(vB):
+                        diamondB = _diamond_for_edge(uB, vB)
+                        if diamondB is not None:
+                            dirB = _rotation_direction(diamondB, uB, vB)
+                            rotB = _compute_diamond_rotation_updates(diamondB, dirB, exclude={b})
 
-                # Niemand geplant → reiner Wartetick (trotz Sampling)
+                # --- NEU: max. eine Raute pro Tick rotieren ---
+                need_rotA = bool(rotA)
+                need_rotB = bool(rotB)
+
+                if need_rotA and need_rotB:
+                    # Priorität deterministisch: A zuerst. B wartet diesen Tick.
+                    pending_updates.update(rotA)
+                    if vA is not None:
+                        pending_updates[a] = vA
+                    # B bewusst NICHT bewegen (weil seine Bewegung eine Rotation erfordern würde)
+                else:
+                    # Nur eine Seite rotiert (oder keine). Dann dürfen beide (sofern vorhanden) ziehen.
+                    if need_rotA:
+                        pending_updates.update(rotA)
+                    if need_rotB:
+                        pending_updates.update(rotB)
+                    if vA is not None:
+                        pending_updates[a] = vA
+                    if vB is not None:
+                        pending_updates[b] = vB
+
                 if not pending_updates:
                     _attempt_tick({})
+                    # Replan mit aktueller Avoidance
+                    forb_for_A = _forbidden_edges_due_to(current_pos[b])
+                    forb_for_B = _forbidden_edges_due_to(current_pos[a])
+                    if current_pos[a] != preA:
+                        newp = _shortest_path_sn_avoiding(current_pos[a], preA, forb_for_A)
+                        if newp is not None:
+                            pathA_to_pre, idxA = newp, 0
+                    if current_pos[b] != preB:
+                        newp = _shortest_path_sn_avoiding(current_pos[b], preB, forb_for_B)
+                        if newp is not None:
+                            pathB_to_pre, idxB = newp, 0
                     continue
 
                 moved = _attempt_tick(pending_updates, sample=True)
@@ -332,31 +429,36 @@ class SequentialDiamondRoutingPlanner:
                         idxA += 1
                     if b in pending_updates:
                         idxB += 1
-                # sonst Wartetick – idxA/idxB unverändert
+                else:
+                    # Wartetick – ggf. neu planen
+                    forb_for_A = _forbidden_edges_due_to(current_pos[b])
+                    forb_for_B = _forbidden_edges_due_to(current_pos[a])
+                    if current_pos[a] != preA:
+                        newp = _shortest_path_sn_avoiding(current_pos[a], preA, forb_for_A)
+                        if newp is not None:
+                            pathA_to_pre, idxA = newp, 0
+                    if current_pos[b] != preB:
+                        newp = _shortest_path_sn_avoiding(current_pos[b], preB, forb_for_B)
+                        if newp is not None:
+                            pathB_to_pre, idxB = newp, 0
 
-            # --- kurzer IN-Hop synchron für beide, defekt-sicher und schrittweise ---
-            # Erster Hop: PRE-IN -> IN (gleichzeitig)  (Sampling AN)
+            # --- IN-Hop synchron ---
             while True:
                 pend = {}
                 if current_pos[a] != meet:
                     pend[a] = meet
                 if current_pos[b] != meet:
                     pend[b] = meet
-
                 if not pend:
-                    break  # bereits beide am IN
+                    break
+                assert all(_is_in(dest) for dest in pend.values())
+                if _attempt_tick(pend, sample=True):
+                    break
 
-                moved = _attempt_tick(pend, sample=True)
-                if moved:
-                    break  # geschafft; weiter zum Rück-Hop
-                # sonst: Wartetick, erneut versuchen
-
-            # Zweiter Hop: IN -> PRE-IN (gleichzeitig)  (Sampling AUS)
             while True:
                 pend = {a: preA, b: preB}
-                moved = _attempt_tick(pend, sample=False)  # << kein Sampling beim Rausgehen aus dem IN
-                if moved:
+                assert _is_sn(preA) and _is_sn(preB)
+                if _attempt_tick(pend, sample=False):
                     break
-                # sonst: Wartetick, erneut versuchen (weiterhin kein Sampling)
 
         return timelines, edge_timebands
