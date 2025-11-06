@@ -11,13 +11,13 @@ from utils.animation import animate_mapf
 if __name__ == "__main__":
     random.seed(5)
     G, qubits, pairs = NetworkBuilder.place_qubits_and_make_pairs(
-        width=2,
-        height=2,
-        n_qubits=12,
-        rounds=5,
-        seed=53,  
+        width=3,
+        height=3,
+        n_qubits=24,
+        rounds=3,
+        seed=24,  
     )
-    """qubits: List[Qubit] = [
+    """ qubits: List[Qubit] = [
         Qubit(0, (2, -3)),
         Qubit(1, (1,  0)),
         Qubit(2, (-1, 0)),

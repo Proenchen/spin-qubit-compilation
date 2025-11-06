@@ -3,7 +3,7 @@ from typing import Dict, List, Optional, Tuple, Set
 import random
 import networkx as nx
 
-from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubit
+from routing.common import Coord, TimedNode, Qubit
 from routing.default_routing import DefaultRoutingPlanner
 
 P_SUCCESS = 1.0
@@ -31,7 +31,9 @@ class RotationRoutingPlanner:
       sich das jeweils andere Paar-Qubit aktuell befindet (IN-Hops ausgenommen).
     - Meeting-Kandidaten werden nach minimaler Gesamtdistanz (A→best PRE + B→best PRE, mit Avoidance)
       sortiert geprüft.
-    - NEU: Pro Tick wird höchstens EINE Raute rotiert (sequentielle Rotationen).
+    - Parallele Rotationen: Pro Tick können ZWEI Rotationen stattfinden, wenn sich die
+      betroffenen Rauten nicht überlappen (keinen Knoten teilen). Überlappen sie, gilt
+      sequentieller Fallback (deterministisch A zuerst).
     """
 
     @staticmethod
@@ -192,9 +194,6 @@ class RotationRoutingPlanner:
         sn_nodes = [n for n in G.nodes() if _is_sn(n)]
         SN = G.subgraph(sn_nodes).copy()
 
-        def _shortest_path_sn(src: Coord, dst: Coord) -> List[Coord]:
-            return nx.shortest_path(SN, src, dst)
-
         def _sn_neighbors_of_meet(meeting: Coord) -> List[Coord]:
             if not _is_in(meeting):
                 return []
@@ -236,6 +235,13 @@ class RotationRoutingPlanner:
                 if best is None or d < best:
                     best = d
             return best
+
+        # ---------- Overlap-Check für parallele Rotation ----------
+        def _diamonds_overlap(d1: Optional[List[Coord]], d2: Optional[List[Coord]]) -> bool:
+            """True, wenn sich zwei Rauten wenigstens einen Knoten teilen."""
+            if d1 is None or d2 is None:
+                return False
+            return not set(d1).isdisjoint(d2)
 
         # ---------- Hauptschleife über Paare ----------
         for qa, qb in pairs:
@@ -367,6 +373,7 @@ class RotationRoutingPlanner:
                 # --- Kandidat A vorbereiten ---
                 rotA: Dict[int, Coord] = {}
                 vA: Optional[Coord] = None
+                diamondA: Optional[List[Coord]] = None
                 if current_pos[a] != preA and idxA + 1 < len(pathA_to_pre):
                     uA = pathA_to_pre[idxA]
                     vA = pathA_to_pre[idxA + 1]
@@ -378,6 +385,7 @@ class RotationRoutingPlanner:
                 # --- Kandidat B vorbereiten ---
                 rotB: Dict[int, Coord] = {}
                 vB: Optional[Coord] = None
+                diamondB: Optional[List[Coord]] = None
                 if current_pos[b] != preB and idxB + 1 < len(pathB_to_pre):
                     uB = pathB_to_pre[idxB]
                     vB = pathB_to_pre[idxB + 1]
@@ -387,16 +395,22 @@ class RotationRoutingPlanner:
                             dirB = _rotation_direction(diamondB, uB, vB)
                             rotB = _compute_diamond_rotation_updates(diamondB, dirB, exclude={b})
 
-                # --- NEU: max. eine Raute pro Tick rotieren ---
                 need_rotA = bool(rotA)
                 need_rotB = bool(rotB)
 
                 if need_rotA and need_rotB:
-                    # Priorität deterministisch: A zuerst. B wartet diesen Tick.
-                    pending_updates.update(rotA)
-                    if vA is not None:
-                        pending_updates[a] = vA
-                    # B bewusst NICHT bewegen (weil seine Bewegung eine Rotation erfordern würde)
+                    # Parallele Rotationen nur, wenn Rauten disjunkt sind; sonst sequentiell (A zuerst).
+                    if not _diamonds_overlap(diamondA, diamondB):
+                        pending_updates.update(rotA)
+                        pending_updates.update(rotB)
+                        if vA is not None:
+                            pending_updates[a] = vA
+                        if vB is not None:
+                            pending_updates[b] = vB
+                    else:
+                        pending_updates.update(rotA)
+                        if vA is not None:
+                            pending_updates[a] = vA
                 else:
                     # Nur eine Seite rotiert (oder keine). Dann dürfen beide (sofern vorhanden) ziehen.
                     if need_rotA:
