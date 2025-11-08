@@ -13,7 +13,7 @@ if __name__ == "__main__":
     G, qubits, pairs = NetworkBuilder.place_qubits_and_make_pairs(
         width=3,
         height=3,
-        n_qubits=24,
+        n_qubits=10,
         rounds=3,
         seed=24,  
     )

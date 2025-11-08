@@ -910,7 +910,7 @@ class DefaultRoutingPlanner:
             changed = False
 
             # Iteriere über eine Momentaufnahme, da wir 'plans' modifizieren könnten
-            for mover_qid, mover_path in list(plans.items()):
+            for mover_qid, mover_path in plans.items():
                 root_pair = blocker_to_pair.get(mover_qid)
                 # Finde Blocker entlang des Mover-Pfads (in Reihenfolge des Auftretens)
                 chain_blockers = build_blocker_chain_along_path(mover_path, root_pair)
