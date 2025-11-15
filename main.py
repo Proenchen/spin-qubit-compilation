@@ -6,6 +6,7 @@ from routing.network import NetworkBuilder
 from routing.routing_with_reroute import RerouteRoutingPlanner
 from routing.default_routing import DefaultRoutingPlanner
 from routing.rotation_routing import RotationRoutingPlanner
+from routing.rotation_bypass_routing import HybridRotationRoutingPlanner, CircleRotationRoutingPlanner
 from utils.animation import animate_mapf
 
 if __name__ == "__main__":
@@ -13,9 +14,9 @@ if __name__ == "__main__":
     G, qubits, pairs = NetworkBuilder.place_qubits_and_make_pairs(
         width=3,
         height=3,
-        n_qubits=10,
+        n_qubits=24,
         rounds=3,
-        seed=24,  
+        seed=8,  
     )
     """ qubits: List[Qubit] = [
         Qubit(0, (2, -3)),
@@ -41,6 +42,6 @@ if __name__ == "__main__":
  """
     #planner = DefaultRoutingPlanner()
     #planner = RerouteRoutingPlanner()
-    planner = RotationRoutingPlanner()
+    planner = HybridRotationRoutingPlanner()
     timelines, edge_timebands = planner.route(G, qubits, pairs)
     animate_mapf(G, timelines, edge_timebands=edge_timebands, smooth=True)

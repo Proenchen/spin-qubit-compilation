@@ -22,22 +22,27 @@ def _edgeset(u: Coord, v: Coord) -> frozenset:
 # =================================================================
 class RotationRoutingPlanner:
     """
-    Layer-basierter Router mit vorausgeplanter Parallelisierung und echten Rotationen:
+    Router mit vorausgeplanter Parallelisierung und echten Rotationen:
 
     - Solo-Plan pro Paar (inkl. Diamond-Rotationen).
     - Gruppenbildung mit:
         * Chebyshev-Distanz zwischen Paaren über gesamte Plan-Dauer >= 3,
-        * disjunkten (knotenfreien) Diamond-Mengen zwischen Plänen.
+        * zeitlich disjunkten Diamond-Mengen zwischen Plänen
+          (kein gemeinsamer Diamond im selben Tick).
     - Parallel-Replay pro Gruppe; bei Fremd-Blockaden (fremde Qubits auf Diamond) sequentieller Fallback.
     - WICHTIG:
         * Beim IN-Hop wird der reale PRE-SN des Qubits nur dann gespeichert, wenn der IN-Hop erfolgreich war.
         * OUT-Hop springt exakt zu diesem gespeicherten PRE zurück.
     - NEU:
         * Nach jeder **erfolgreichen Interaktion** eines Paars (OUT-Hop ausgeführt)
-          werden Solo-Pläne & Parallel-Gruppen für die verbleibenden Paare im Layer **neu berechnet**.
+          werden Solo-Pläne & Parallel-Gruppen für die verbleibenden Paare **neu berechnet**.
     - NEU (Defekt-Handling):
-        * Wenn ein Step wegen defekter Kante scheitert (moved==False), wird **dieselbe Bewegung im nächsten Tick wiederholt**
-          (statt den Step zu überspringen oder sofort in einen anderen Modus zu wechseln).
+        * Wenn ein Step wegen defekter Kante scheitert (moved==False), wird **dieselbe Bewegung im nächsten Tick wiederholt**.
+    - NEU (Interaktions-Reihenfolge):
+        * Die Reihenfolge der Paare in `pairs` definiert für jedes Qubit eine
+          Sequenz von Interaktionen. Ein Qubit interagiert mit seinen Partnern
+          in genau dieser Reihenfolge (kein 1-3 vor 1-2, wenn (1,2) vorher in
+          `pairs` steht).
     """
 
     @staticmethod
@@ -146,6 +151,7 @@ class RotationRoutingPlanner:
         # ---------- Solo-Plan für ein Paar ----------
         class SoloStep:
             __slots__ = ("updates_pair_only", "sample", "diamonds")  # diamonds: List[(diamond, dir)]
+
             def __init__(self, updates_pair_only: Dict[int, Coord], sample: bool, diamonds: List[Tuple[List[Coord], int]]):
                 self.updates_pair_only = updates_pair_only
                 self.sample = sample
@@ -155,10 +161,11 @@ class RotationRoutingPlanner:
             """
             - ticks: Liste SoloStep
             - pos_trace: qid -> [pos_t0, pos_t1, ..., pos_tN] (nur für die zwei Qubits des Paars)
-            - used_diamonds: Menge kanonischer Diamond-Knoten-Tupel (für Gruppen-Disjunktheit)
+            - used_diamonds: Menge kanonischer Diamond-Knoten-Tupel (nur informativ)
             - in_idx: Index des IN-Hops im Tick-Array (oder None)
             - out_idx: Index des OUT-Hops (oder None)
             """
+
             def __init__(
                 self,
                 ticks: List[SoloStep],
@@ -181,8 +188,12 @@ class RotationRoutingPlanner:
             return tuple(sorted(D))
 
         def _compute_pair_rotation_updates_for_diamond(
-            diamond: List[Coord], direction: int,
-            a_id: int, b_id: int, la: Coord, lb: Coord
+            diamond: List[Coord],
+            direction: int,
+            a_id: int,
+            b_id: int,
+            la: Coord,
+            lb: Coord,
         ) -> Dict[int, Coord]:
             idx = {p: i for i, p in enumerate(diamond)}
             out: Dict[int, Coord] = {}
@@ -204,7 +215,9 @@ class RotationRoutingPlanner:
             in_idx: Optional[int] = None
             out_idx: Optional[int] = None
 
-            cands = DefaultRoutingPlanner._best_meeting_candidates(G, la, lb, reserved=set(), forbidden_nodes=set())
+            cands = DefaultRoutingPlanner._best_meeting_candidates(
+                G, la, lb, reserved=set(), forbidden_nodes=set()
+            )
 
             def _best_pre(meet: Coord, src: Coord) -> Optional[Tuple[Coord, List[Coord]]]:
                 best = None
@@ -243,7 +256,9 @@ class RotationRoutingPlanner:
                         dA = _diamond_for_edge(uA, vA)
                         if dA:
                             dirA = _rot_dir(dA, uA, vA)
-                            updA = _compute_pair_rotation_updates_for_diamond(dA, dirA, a_id, b_id, la, lb)
+                            updA = _compute_pair_rotation_updates_for_diamond(
+                                dA, dirA, a_id, b_id, la, lb
+                            )
                             updA[a_id] = vA
                             updates.update(updA)
                             diamonds_for_step.append((dA, dirA))
@@ -259,7 +274,9 @@ class RotationRoutingPlanner:
                         dB = _diamond_for_edge(uB, vB)
                         if dB:
                             dirB = _rot_dir(dB, uB, vB)
-                            updB = _compute_pair_rotation_updates_for_diamond(dB, dirB, a_id, b_id, la, lb)
+                            updB = _compute_pair_rotation_updates_for_diamond(
+                                dB, dirB, a_id, b_id, la, lb
+                            )
                             updB[b_id] = vB
                             if not (diamonds_for_step and set(diamonds_for_step[0][0]).intersection(dB)):
                                 updates.update(updB)
@@ -282,7 +299,13 @@ class RotationRoutingPlanner:
                 if b_id in updates:
                     idxB = min(idxB + 1, len(pathB) - 1)
 
-                ticks.append(SoloStep(updates_pair_only=updates, sample=True, diamonds=diamonds_for_step))
+                ticks.append(
+                    SoloStep(
+                        updates_pair_only=updates,
+                        sample=True,
+                        diamonds=diamonds_for_step,
+                    )
+                )
                 trace[a_id].append(la)
                 trace[b_id].append(lb)
 
@@ -308,38 +331,27 @@ class RotationRoutingPlanner:
 
             return SoloPlan(ticks, trace, used_diamonds, in_idx, out_idx)
 
-        # ---------- Layerbildung (greedy, Startabstand >=3) ----------
-        def _initial_layers() -> List[List[Tuple[int, int]]]:
-            ids = [(qa.id, qb.id) for (qa, qb) in pairs]
-            def _pair_far_enough(p1: Tuple[int, int], p2: Tuple[int, int]) -> bool:
-                P = [current_pos[p1[0]], current_pos[p1[1]]]
-                Q = [current_pos[p2[0]], current_pos[p2[1]]]
-                return all(chebyshev(u, v) >= 3 for u in P for v in Q)
-
-            layers: List[List[Tuple[int, int]]] = []
-            for pid in ids:
-                placed = False
-                for L in layers:
-                    if all(_pair_far_enough(pid, x) for x in L):
-                        L.append(pid)
-                        placed = True
-                        break
-                if not placed:
-                    layers.append([pid])
-            return layers
-
         # ---------- Kompatibilität der Solo-Pläne ----------
-        def _plans_compatible_distance(p1: SoloPlan, ab1: Tuple[int, int], p2: SoloPlan, ab2: Tuple[int, int]) -> bool:
+        def _plans_compatible_distance(
+            p1: SoloPlan,
+            ab1: Tuple[int, int],
+            p2: SoloPlan,
+            ab2: Tuple[int, int],
+        ) -> bool:
             a1, b1 = ab1
             a2, b2 = ab2
             L = max(p1.length, p2.length)
+
             def _pos(plan: SoloPlan, qid: int, i: int) -> Coord:
                 if i < len(plan.pos_trace[qid]):
                     return plan.pos_trace[qid][i]
                 return plan.pos_trace[qid][-1]
+
             for i in range(0, L + 1):
-                p_a1 = _pos(p1, a1, i); p_b1 = _pos(p1, b1, i)
-                p_a2 = _pos(p2, a2, i); p_b2 = _pos(p2, b2, i)
+                p_a1 = _pos(p1, a1, i)
+                p_b1 = _pos(p1, b1, i)
+                p_a2 = _pos(p2, a2, i)
+                p_b2 = _pos(p2, b2, i)
                 for u in (p_a1, p_b1):
                     for v in (p_a2, p_b2):
                         if chebyshev(u, v) < 3:
@@ -347,24 +359,54 @@ class RotationRoutingPlanner:
             return True
 
         def _plans_compatible_diamonds(p1: SoloPlan, p2: SoloPlan) -> bool:
-            return p1.used_diamonds.isdisjoint(p2.used_diamonds)
+            """
+            Zwei Solo-Pläne sind diamond-kompatibel, wenn sie in keinem Tick
+            *gleichzeitig* dieselbe Diamond benutzen.
+            """
+            L = max(p1.length, p2.length)
+
+            for i in range(L):
+                # Diamonds von p1 in Tick i
+                if i < p1.length:
+                    d1 = {
+                        _canonical_diamond_tuple(D)
+                        for (D, _dir) in p1.ticks[i].diamonds
+                    }
+                else:
+                    d1 = set()
+
+                # Diamonds von p2 in Tick i
+                if i < p2.length:
+                    d2 = {
+                        _canonical_diamond_tuple(D)
+                        for (D, _dir) in p2.ticks[i].diamonds
+                    }
+                else:
+                    d2 = set()
+
+                # Wenn es in diesem Tick eine gemeinsame Diamond gibt -> Konflikt
+                if not d1.isdisjoint(d2):
+                    return False
+
+            # In keinem Tick gemeinsame Diamond -> kompatibel
+            return True
 
         # ---------- Gruppenbildung ----------
         def _group_parallel(plans: Dict[Tuple[int, int], SoloPlan]) -> List[List[Tuple[int, int]]]:
-            remaining = sorted(plans.keys())
+            remaining_pids = sorted(plans.keys())
             groups: List[List[Tuple[int, int]]] = []
             used: Set[Tuple[int, int]] = set()
-            for pid in remaining:
+            for pid in remaining_pids:
                 if pid in used:
                     continue
                 grp = [pid]
                 used.add(pid)
-                for qid in remaining:
+                for qid in remaining_pids:
                     if qid in used:
                         continue
                     ok = all(
-                        _plans_compatible_distance(plans[pid0], pid0, plans[qid], qid) and
-                        _plans_compatible_diamonds(plans[pid0], plans[qid])
+                        _plans_compatible_distance(plans[pid0], pid0, plans[qid], qid)
+                        and _plans_compatible_diamonds(plans[pid0], plans[qid])
                         for pid0 in grp
                     )
                     if ok:
@@ -377,11 +419,11 @@ class RotationRoutingPlanner:
         def _expand_runtime_rotations(
             base_updates: Dict[int, Coord],
             diamonds: List[Tuple[List[Coord], int]],
-            exclude_qids: Set[int] = set()
+            exclude_qids: Set[int] = set(),
         ) -> Dict[int, Coord]:
             if not diamonds:
                 return dict(base_updates)
-            idx_cache = {}
+            idx_cache: Dict[Tuple[Coord, Coord, Coord, Coord], Dict[Coord, int]] = {}
             out = dict(base_updates)
             for D, direction in diamonds:
                 key = tuple(D)
@@ -396,11 +438,12 @@ class RotationRoutingPlanner:
             return out
 
         def _foreign_qubits_on_any_diamond(
-            diamonds: List[Tuple[List[Coord], int]], allowed: Set[int]
+            diamonds: List[Tuple[List[Coord], int]],
+            allowed: Set[int],
         ) -> bool:
             if not diamonds:
                 return False
-            nodes = set()
+            nodes: Set[Coord] = set()
             for D, _ in diamonds:
                 nodes |= set(D)
             for qid, pos in current_pos.items():
@@ -413,169 +456,226 @@ class RotationRoutingPlanner:
         # ---- Live-Map: PRE-SN zum Zeitpunkt eines *erfolgreichen* IN-Hops (pro Paar) ----
         live_pre_by_pair: Dict[Tuple[int, int], Dict[int, Coord]] = {}
 
-        # ===================== Hauptroutine über Layers =====================
-        for layer in _initial_layers():
-            remaining: Set[Tuple[int, int]] = {(qa.id, qb.id) for qa, qb in pairs if (qa.id, qb.id) in set(layer)}
+        # ---- Interaktions-Reihenfolge: Index der Paare im Original-Array ----
+        pair_order: Dict[Tuple[int, int], int] = {}
+        for idx, (qa, qb) in enumerate(pairs):
+            pid = (qa.id, qb.id)
+            pair_order[pid] = idx
 
-            while remaining:
-                # 1) Solo-Pläne für verbleibende Paare
-                plans: Dict[Tuple[int, int], SoloPlan] = {}
-                sequential_fallback: List[Tuple[int, int]] = []
-                for pid in sorted(remaining):
-                    a, b = pid
-                    plan = _plan_pair_solo(a, b)
-                    if plan is None:
-                        sequential_fallback.append((a, b))
+        def _is_ready_pair(pid: Tuple[int, int], remaining_pids: Set[Tuple[int, int]]) -> bool:
+            """
+            Ein Paar ist 'ready', wenn es für beide Qubits kein früheres
+            (im Sinne der pairs-Liste) verbleibendes Paar gibt, das dieses Qubit enthält.
+            """
+            idx = pair_order[pid]
+            a, b = pid
+            for other in remaining_pids:
+                if other == pid:
+                    continue
+                j = pair_order[other]
+                if j < idx:
+                    x, y = other
+                    if x == a or x == b or y == a or y == b:
+                        return False
+            return True
+
+        # ===================== Hauptroutine mit Ordnungs-Constraint =====================
+        remaining: Set[Tuple[int, int]] = {(qa.id, qb.id) for qa, qb in pairs}
+
+        while remaining:
+            # 1) Nur "ready" Paare dürfen in diesem Durchlauf geplant werden
+            ready_pids = [pid for pid in remaining if _is_ready_pair(pid, remaining)]
+
+            # Failsafe: falls wegen inkonsistenter Daten nichts ready ist, nimm alles
+            if not ready_pids:
+                ready_pids = list(remaining)
+
+            # 2) Solo-Pläne für ready-Paare
+            plans: Dict[Tuple[int, int], SoloPlan] = {}
+            sequential_fallback: List[Tuple[int, int]] = []
+            for pid in sorted(ready_pids, key=lambda p: pair_order[p]):
+                a, b = pid
+                plan = _plan_pair_solo(a, b)
+                if plan is None:
+                    sequential_fallback.append((a, b))
+                else:
+                    plans[pid] = plan
+
+            if not plans and not sequential_fallback:
+                _commit_tick({}, sample=True)
+                break
+
+            # 3) Parallelgruppen
+            groups = _group_parallel(plans) if plans else []
+
+            something_finished = False
+
+            for grp in groups:
+                group_qids: Set[int] = {x for ab in grp for x in ab}
+                L = max(plans[pid].length for pid in grp) if grp else 0
+                parallel_failed = False
+
+                # --- Parallel-Replay MIT Retry bei Defekt ---
+                step = 0
+                while step < L:
+                    updates_pair_only: Dict[int, Coord] = {}
+                    sample_flags: List[bool] = []
+                    step_diamonds: List[Tuple[List[Coord], int]] = []
+                    conflict = False
+
+                    # temporäre PREs für IN-Hops dieses Steps (werden nur bei Erfolg übernommen)
+                    pending_live_pre: Dict[Tuple[int, int], Dict[int, Coord]] = {}
+
+                    for pid in grp:
+                        plan = plans[pid]
+                        if step < plan.length:
+                            s = plan.ticks[step]
+                        else:
+                            s = SoloStep({}, True, [])
+
+                        # IN-Hop: PRE vor Commit zwischenspeichern
+                        if plan.in_idx is not None and step == plan.in_idx:
+                            a_id, b_id = pid
+                            pending_live_pre[pid] = {
+                                a_id: current_pos[a_id],
+                                b_id: current_pos[b_id],
+                            }
+
+                        # OUT-Hop: Ziel aus bereits gemerkten PREs (falls nicht vorhanden, failsafe: aktuelle Pos)
+                        if plan.out_idx is not None and step == plan.out_idx:
+                            a_id, b_id = pid
+                            pre_map = live_pre_by_pair.get(
+                                pid,
+                                {a_id: current_pos[a_id], b_id: current_pos[b_id]},
+                            )
+                            s = SoloStep(
+                                {a_id: pre_map[a_id], b_id: pre_map[b_id]},
+                                False,
+                                [],
+                            )
+
+                        # Kollision gleicher Qubits?
+                        if set(updates_pair_only.keys()) & set(s.updates_pair_only.keys()):
+                            conflict = True
+                            break
+                        updates_pair_only.update(s.updates_pair_only)
+                        sample_flags.append(s.sample)
+                        step_diamonds.extend(s.diamonds)
+
+                    if conflict:
+                        parallel_failed = True
+                        break
+
+                    if _foreign_qubits_on_any_diamond(step_diamonds, allowed=group_qids):
+                        parallel_failed = True
+                        break
+
+                    updates = _expand_runtime_rotations(
+                        updates_pair_only,
+                        step_diamonds,
+                    )
+                    do_sample = False not in sample_flags
+
+                    moved = _commit_tick(updates, sample=do_sample)
+                    if moved:
+                        # IN-Hop(e) dieses Steps waren erfolgreich -> PREs jetzt fest übernehmen
+                        for pid, pre in pending_live_pre.items():
+                            live_pre_by_pair[pid] = pre
+                        step += 1  # NÄCHSTER Step
                     else:
-                        plans[pid] = plan
+                        # Defekt -> RETRY gleicher Step im nächsten Tick
+                        continue
 
-                if not plans and not sequential_fallback:
-                    _commit_tick({}, sample=True)
-                    break
-
-                # 2) Parallelgruppen
-                groups = _group_parallel(plans) if plans else []
-
-                something_finished = False
-
-                for grp in groups:
-                    group_qids: Set[int] = {x for ab in grp for x in ab}
-                    L = max(plans[pid].length for pid in grp) if grp else 0
-                    parallel_failed = False
-
-                    # --- Parallel-Replay MIT Retry bei Defekt ---
-                    step = 0
-                    while step < L:
-                        updates_pair_only: Dict[int, Coord] = {}
-                        sample_flags: List[bool] = []
-                        step_diamonds: List[Tuple[List[Coord], int]] = []
-                        conflict = False
-
-                        # temporäre PREs für IN-Hops dieses Steps (werden nur bei Erfolg übernommen)
-                        pending_live_pre: Dict[Tuple[int, int], Dict[int, Coord]] = {}
-
-                        for pid in grp:
-                            plan = plans[pid]
-                            if step < plan.length:
-                                s = plan.ticks[step]
-                            else:
-                                s = SoloStep({}, True, [])
-
-                            # Fremdblockaden prüfen (bevor wir committen)
-                            # (Wenn dauerhaft blockiert, gehen wir später in Fallback/Replan.)
-                            # IN-Hop: PRE vor Commit zwischenspeichern
+                if parallel_failed:
+                    # --- Sequentieller Fallback MIT Retry bei Defekt ---
+                    for pid in grp:
+                        plan = plans[pid]
+                        a_id, b_id = pid
+                        step = 0
+                        while step < plan.length:
+                            s = plan.ticks[step]
+                            # IN-Hop -> PRE vor Commit zwischenspeichern, aber erst bei Erfolg übernehmen
+                            pending_pre = None
                             if plan.in_idx is not None and step == plan.in_idx:
-                                a_id, b_id = pid
-                                pending_live_pre[pid] = {
+                                pending_pre = {
                                     a_id: current_pos[a_id],
                                     b_id: current_pos[b_id],
                                 }
 
-                            # OUT-Hop: Ziel aus bereits gemerkten PREs (falls nicht vorhanden, failsafe: aktuelle Pos)
+                            # OUT-Hop -> live PRE nutzen
                             if plan.out_idx is not None and step == plan.out_idx:
-                                a_id, b_id = pid
                                 pre_map = live_pre_by_pair.get(
                                     pid,
                                     {a_id: current_pos[a_id], b_id: current_pos[b_id]},
                                 )
-                                s = SoloStep({a_id: pre_map[a_id], b_id: pre_map[b_id]}, False, [])
+                                s = SoloStep(
+                                    {a_id: pre_map[a_id], b_id: pre_map[b_id]},
+                                    False,
+                                    [],
+                                )
 
-                            # Kollision gleicher Qubits?
-                            if set(updates_pair_only.keys()) & set(s.updates_pair_only.keys()):
-                                conflict = True
-                                break
-                            updates_pair_only.update(s.updates_pair_only)
-                            sample_flags.append(s.sample)
-                            step_diamonds.extend(s.diamonds)
+                            updates = _expand_runtime_rotations(
+                                s.updates_pair_only,
+                                s.diamonds,
+                            )
+                            moved = _commit_tick(updates, sample=s.sample)
+                            if moved:
+                                if pending_pre is not None:
+                                    live_pre_by_pair[pid] = pending_pre
+                                step += 1
+                            else:
+                                # Defekt -> RETRY selben Step
+                                continue
 
-                        if conflict:
-                            parallel_failed = True
-                            break
+                # Gruppe abgeschlossen -> Paare entfernen und REPLAN starten
+                for pid in grp:
+                    if pid in remaining:
+                        remaining.remove(pid)
+                something_finished = True
+                break  # replan
 
-                        if _foreign_qubits_on_any_diamond(step_diamonds, allowed=group_qids):
-                            parallel_failed = True
-                            break
-
-                        updates = _expand_runtime_rotations(updates_pair_only, step_diamonds)
-                        do_sample = False not in sample_flags
-
-                        moved = _commit_tick(updates, sample=do_sample)
-                        if moved:
-                            # IN-Hop(e) dieses Steps waren erfolgreich -> PREs jetzt fest übernehmen
-                            for pid, pre in pending_live_pre.items():
-                                live_pre_by_pair[pid] = pre
-                            step += 1  # NÄCHSTER Step
-                        else:
-                            # Defekt -> RETRY gleicher Step im nächsten Tick
-                            continue
-
-                    if parallel_failed:
-                        # --- Sequentieller Fallback MIT Retry bei Defekt ---
-                        for pid in grp:
-                            plan = plans[pid]
-                            a_id, b_id = pid
-                            step = 0
-                            while step < plan.length:
-                                s = plan.ticks[step]
-                                # IN-Hop -> PRE vor Commit zwischenspeichern, aber erst bei Erfolg übernehmen
-                                pending_pre = None
-                                if plan.in_idx is not None and step == plan.in_idx:
-                                    pending_pre = {a_id: current_pos[a_id], b_id: current_pos[b_id]}
-
-                                # OUT-Hop -> live PRE nutzen
-                                if plan.out_idx is not None and step == plan.out_idx:
-                                    pre_map = live_pre_by_pair.get(
-                                        pid,
-                                        {a_id: current_pos[a_id], b_id: current_pos[b_id]},
-                                    )
-                                    s = SoloStep({a_id: pre_map[a_id], b_id: pre_map[b_id]}, False, [])
-
-                                updates = _expand_runtime_rotations(s.updates_pair_only, s.diamonds)
-                                moved = _commit_tick(updates, sample=s.sample)
-                                if moved:
-                                    if pending_pre is not None:
-                                        live_pre_by_pair[pid] = pending_pre
-                                    step += 1
-                                else:
-                                    # Defekt -> RETRY selben Step
-                                    continue
-
-                    # Gruppe abgeschlossen -> Paare entfernen und REPLAN starten
-                    for pid in grp:
-                        if pid in remaining:
-                            remaining.remove(pid)
-                    something_finished = True
-                    break  # replan
-
-                # Nichts fertig geworden -> sequential_fallback (ein Paar), mit Retry
-                if not something_finished:
-                    if sequential_fallback:
-                        a, b = sequential_fallback[0]
-                        plan = _plan_pair_solo(a, b)
-                        if plan is None:
-                            _commit_tick({}, sample=True)
-                        else:
-                            pid = (a, b)
-                            step = 0
-                            while step < plan.length:
-                                s = plan.ticks[step]
-                                pending_pre = None
-                                if plan.in_idx is not None and step == plan.in_idx:
-                                    pending_pre = {a: current_pos[a], b: current_pos[b]}
-                                if plan.out_idx is not None and step == plan.out_idx:
-                                    pre_map = live_pre_by_pair.get(pid, {a: current_pos[a], b: current_pos[b]})
-                                    s = SoloStep({a: pre_map[a], b: pre_map[b]}, False, [])
-                                updates = _expand_runtime_rotations(s.updates_pair_only, s.diamonds)
-                                moved = _commit_tick(updates, sample=s.sample)
-                                if moved:
-                                    if pending_pre is not None:
-                                        live_pre_by_pair[pid] = pending_pre
-                                    step += 1
-                                else:
-                                    continue
-                        if (a, b) in remaining:
-                            remaining.remove((a, b))
-                    else:
+            # Nichts fertig geworden -> sequential_fallback (ein ready Paar), mit Retry
+            if not something_finished:
+                if sequential_fallback:
+                    a, b = sequential_fallback[0]
+                    plan = _plan_pair_solo(a, b)
+                    if plan is None:
                         _commit_tick({}, sample=True)
+                    else:
+                        pid = (a, b)
+                        step = 0
+                        while step < plan.length:
+                            s = plan.ticks[step]
+                            pending_pre = None
+                            if plan.in_idx is not None and step == plan.in_idx:
+                                pending_pre = {
+                                    a: current_pos[a],
+                                    b: current_pos[b],
+                                }
+                            if plan.out_idx is not None and step == plan.out_idx:
+                                pre_map = live_pre_by_pair.get(
+                                    pid,
+                                    {a: current_pos[a], b: current_pos[b]},
+                                )
+                                s = SoloStep(
+                                    {a: pre_map[a], b: pre_map[b]},
+                                    False,
+                                    [],
+                                )
+                            updates = _expand_runtime_rotations(
+                                s.updates_pair_only,
+                                s.diamonds,
+                            )
+                            moved = _commit_tick(updates, sample=s.sample)
+                            if moved:
+                                if pending_pre is not None:
+                                    live_pre_by_pair[pid] = pending_pre
+                                step += 1
+                            else:
+                                continue
+                    if (a, b) in remaining:
+                        remaining.remove((a, b))
+                else:
+                    _commit_tick({}, sample=True)
 
         return timelines, edge_timebands
