@@ -30,7 +30,7 @@ if __name__ == "__main__":
         p_repair=0.05,
 
         # For Qubit-Placement and interactions
-        seed=42
+        seed=13
     )
 
     simulator = RoutingSimulator(

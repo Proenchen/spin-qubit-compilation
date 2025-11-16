@@ -1715,76 +1715,70 @@ class HybridRotationRoutingPlanner(RoutingStrategy):
                         tried_circle = False
 
                         # Hinweis: Wir starten zunächst mit dem vorhandenen ROTATIONS-Plan.
-                        while True:
-                            if plan is None and not tried_circle:
-                                # Kein Rotationsplan? -> Versuche direkt Circle-Plan
-                                tried_circle = True
-                                plan = _plan_pair_solo_circle(a_id, b_id)
-                                if plan is not None:
-                                    use_circle = True
-                                    # Frisch starten mit diesem Plan
-                                    step = 0
-                                else:
-                                    # Weder Rotations- noch Circle-Plan -> warten
-                                    _commit_tick({}, sample=True)
-                                    break
-
-                            if plan is None:
+                        if plan is None and not tried_circle:
+                            # Kein Rotationsplan? -> Versuche direkt Circle-Plan
+                            tried_circle = True
+                            plan = _plan_pair_solo_circle(a_id, b_id)
+                            if plan is not None:
+                                use_circle = True
+                                # Frisch starten mit diesem Plan
+                                step = 0
+                            else:
+                                # Weder Rotations- noch Circle-Plan -> warten
                                 _commit_tick({}, sample=True)
                                 break
 
-                            step = 0
-                            while step < plan.length:
-                                s = plan.ticks[step]
-                                # IN-Hop -> PRE vor Commit zwischenspeichern, aber erst bei Erfolg übernehmen
-                                pending_pre = None
-                                if plan.in_idx is not None and step == plan.in_idx:
-                                    pending_pre = {
+                        if plan is None:
+                            _commit_tick({}, sample=True)
+                            break
+
+                        step = 0
+                        while step < plan.length:
+                            s = plan.ticks[step]
+                            # IN-Hop -> PRE vor Commit zwischenspeichern, aber erst bei Erfolg übernehmen
+                            pending_pre = None
+                            if plan.in_idx is not None and step == plan.in_idx:
+                                pending_pre = {
+                                    a_id: current_pos[a_id],
+                                    b_id: current_pos[b_id],
+                                }
+
+                            # OUT-Hop -> live PRE nutzen
+                            if plan.out_idx is not None and step == plan.out_idx:
+                                pre_map = live_pre_by_pair.get(
+                                    pid,
+                                    {
                                         a_id: current_pos[a_id],
                                         b_id: current_pos[b_id],
-                                    }
-
-                                # OUT-Hop -> live PRE nutzen
-                                if plan.out_idx is not None and step == plan.out_idx:
-                                    pre_map = live_pre_by_pair.get(
-                                        pid,
-                                        {
-                                            a_id: current_pos[a_id],
-                                            b_id: current_pos[b_id],
-                                        },
-                                    )
-                                    s = SoloStep(
-                                        {a_id: pre_map[a_id], b_id: pre_map[b_id]},
-                                        False,
-                                        [],
-                                    )
-
-                                updates = _expand_runtime_rotations(
-                                    s.updates_pair_only,
-                                    s.diamonds,
+                                    },
                                 )
-                                moved = _commit_tick(updates, sample=s.sample)
-                                if moved:
-                                    if pending_pre is not None:
-                                        live_pre_by_pair[pid] = pending_pre
-                                    step += 1
-                                else:
-                                    # Defekt -> Hybrid-Fallback:
-                                    #   Falls wir noch nicht auf Kreise gewechselt haben,
-                                    #   versuche einen Circle-SoloPlan von der *aktuellen* Position.
-                                    if (not use_circle) and (not tried_circle):
-                                        tried_circle = True
-                                        circle_plan = _plan_pair_solo_circle(a_id, b_id)
-                                        if circle_plan is not None:
-                                            use_circle = True
-                                            plan = circle_plan
-                                            # Neustart des Paars mit Circle-Plan
-                                            step = 0
-                                            continue
-                                    # Wenn kein Circle-Plan möglich oder schon im Circle-Plan:
-                                    #   -> Originalverhalten: RETRY selben Step (d.h. Warten)
-                                    continue
-                            break  # Plan für dieses Pair abgearbeitet
+                                s = SoloStep(
+                                    {a_id: pre_map[a_id], b_id: pre_map[b_id]},
+                                    False,
+                                    [],
+                                )
+
+                            updates = _expand_runtime_rotations(
+                                s.updates_pair_only,
+                                s.diamonds,
+                            )
+                            moved = _commit_tick(updates, sample=s.sample)
+                            if moved:
+                                if pending_pre is not None:
+                                    live_pre_by_pair[pid] = pending_pre
+                                step += 1
+                            else:
+                                # Defekt -> Hybrid-Fallback:
+                                #   Falls wir noch nicht auf Kreise gewechselt haben,
+                                #   versuche einen Circle-SoloPlan von der *aktuellen* Position.
+                                if (not use_circle) and (not tried_circle):
+                                    tried_circle = True
+                                    circle_plan = _plan_pair_solo_circle(a_id, b_id)
+                                    if circle_plan is not None:
+                                        use_circle = True
+                                        plan = circle_plan
+                                        # Neustart des Paars mit Circle-Plan
+                                        step = 0
 
                     # Gruppe abgeschlossen -> Paare entfernen und REPLAN starten
                 for pid in grp:
@@ -1854,10 +1848,6 @@ class HybridRotationRoutingPlanner(RoutingStrategy):
                                         use_circle = True
                                         plan = circle_plan
                                         step = 0
-                                        continue
-                                # Wenn kein Circle-Plan oder bereits im Circle-Plan:
-                                #   -> Originalverhalten: RETRY selben Step (d.h. Warten)
-                                continue
 
                     if (a, b) in remaining:
                         remaining.remove((a, b))
