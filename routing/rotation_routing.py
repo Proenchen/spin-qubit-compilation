@@ -5,9 +5,7 @@ import networkx as nx
 
 from routing.common import Coord, TimedNode, Qubit
 from routing.default_routing import DefaultRoutingPlanner
-
-P_SUCCESS = 0.998
-P_REPAIR = 0.25
+from routing.routing_strategy import RoutingStrategy
 
 # ------------------------- Utils -------------------------
 def chebyshev(p: Coord, q: Coord) -> int:
@@ -20,7 +18,7 @@ def _edgeset(u: Coord, v: Coord) -> frozenset:
 # =================================================================
 #                           ROUTER
 # =================================================================
-class RotationRoutingPlanner:
+class RotationRoutingPlanner(RoutingStrategy):
     """
     Router mit vorausgeplanter Parallelisierung und echten Rotationen:
 
@@ -44,14 +42,13 @@ class RotationRoutingPlanner:
           in genau dieser Reihenfolge (kein 1-3 vor 1-2, wenn (1,2) vorher in
           `pairs` steht).
     """
-
-    @staticmethod
     def route(
+        self,
         G: nx.Graph,
         qubits: List[Qubit],
         pairs: List[Tuple[Qubit, Qubit]],
-        p_success: float = P_SUCCESS,
-        p_repair: float = P_REPAIR,
+        p_success: float,
+        p_repair: float,
     ):
         # --- Zustand ---
         current_pos: Dict[int, Coord] = {q.id: q.pos for q in qubits}
@@ -640,7 +637,7 @@ class RotationRoutingPlanner:
                     a, b = sequential_fallback[0]
                     plan = _plan_pair_solo(a, b)
                     if plan is None:
-                        _commit_tick({}, sample=True)
+                        _commit_tick({}, sample=False)
                     else:
                         pid = (a, b)
                         step = 0

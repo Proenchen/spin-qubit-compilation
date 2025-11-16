@@ -5,9 +5,10 @@ import networkx as nx
 
 from routing.common import Coord, TimedNode, Qubit
 from routing.default_routing import DefaultRoutingPlanner
+from routing.routing_strategy import RoutingStrategy
+from routing.rotation_routing import RotationRoutingPlanner
 
-P_SUCCESS = 0.998
-P_REPAIR = 0.04
+from collections import deque
 
 
 def chebyshev(p: Coord, q: Coord) -> int:
@@ -37,8 +38,8 @@ class CircleRotationRoutingPlanner:
         G: nx.Graph,
         qubits: List[Qubit],
         pairs: List[Tuple[Qubit, Qubit]],
-        p_success: float = P_SUCCESS,
-        p_repair: float = P_REPAIR,
+        p_success: float,
+        p_repair: float,
     ):
         # --- Zustand ---
         current_pos: Dict[int, Coord] = {q.id: q.pos for q in qubits}
@@ -147,12 +148,19 @@ class CircleRotationRoutingPlanner:
                 out[b_id] = loop[(idx[lb] + direction) % n]
             return out
 
-        def _circle_for_edge(u: Coord, v: Coord, target_len: int = 8) -> Optional[List[Coord]]:
+        def _circle_for_edge(
+            u: Coord,
+            v: Coord,
+            target_lens: Tuple[int, ...] = (6, 8),
+        ) -> Optional[List[Coord]]:
             """
-            Suche einen einfachen Zyklus der Länge `target_len` im SN-Subgraphen,
-            der die Kante (u, v) enthält. Wir konstruieren dafür einen einfachen
-            Pfad von v nach u mit genau target_len Knoten (d. h. target_len-1 Kanten),
-            wobei die direkte Kante (u, v) nur zum Schluss verwendet wird.
+            Suche einen einfachen Zyklus der Länge in `target_lens` im SN-Subgraphen,
+            der die Kante (u, v) enthält, und KEINE defekten Kanten benutzt.
+
+            Strategie:
+            - Versuche zuerst einen Zyklus mit Länge 8 (Standard),
+            - falls keiner existiert, versuche einen 6-Zyklus.
+            - Gibt den ersten gefundenen Loop zurück.
 
             Rückgabeformat: [u, v, ..., node] – zyklische Liste der Knoten.
             """
@@ -161,31 +169,46 @@ class CircleRotationRoutingPlanner:
             if not SN.has_edge(u, v):
                 return None
 
-            start = v
-            max_nodes = target_len
+            # Die Kante (u, v) selbst darf nicht defekt sein
+            if _edgeset(u, v) in defective_edges:
+                return None
 
-            # DFS mit Längenbegrenzung auf target_len Knoten (inkl. u)
-            stack: List[Tuple[Coord, List[Coord]]] = [(start, [start])]
-            while stack:
-                node, path = stack.pop()
-                if len(path) >= max_nodes:
-                    continue
+            for target_len in target_lens:
+                start = v
+                max_nodes = target_len
 
-                for w in SN.neighbors(node):
-                    if w == u:
-                        full_path = path + [u]  # [v, ..., node, u]
-                        if len(full_path) == max_nodes:
-                            # Zyklus-Order: [u, v, ..., node]
-                            loop = [u] + path  # u + [v, ..., node]
-                            return loop
-                        else:
-                            continue
+                # BFS mit Längenbegrenzung auf max_nodes Knoten (inkl. u)
+                queue: deque[Tuple[Coord, List[Coord]]] = deque()
+                queue.append((start, [start]))
 
-                    if w in path or w == u:
+                while queue:
+                    node, path = queue.popleft()
+
+                    if len(path) >= max_nodes:
                         continue
 
-                    if len(path) + 1 <= max_nodes:
-                        stack.append((w, path + [w]))
+                    for w in SN.neighbors(node):
+                        # Kante (node, w) darf nicht defekt sein
+                        if _edgeset(node, w) in defective_edges:
+                            continue
+
+                        if w == u:
+                            # Abschluss-Kante (node, u) darf nicht defekt sein
+                            if _edgeset(node, u) in defective_edges:
+                                continue
+
+                            full_path = path + [u]  # [v, ..., node, u]
+                            if len(full_path) == max_nodes:
+                                loop = [u] + path  # [u, v, ..., node]
+                                return loop
+                            else:
+                                continue
+
+                        if w in path or w == u:
+                            continue
+
+                        if len(path) + 1 <= max_nodes:
+                            queue.append((w, path + [w]))
 
             return None
 
@@ -691,77 +714,228 @@ class CircleRotationRoutingPlanner:
         return timelines, edge_timebands
 
 
-# ============================================================
-#  HILFSFUNKTION: erkennen, ob es Defekt-Warte-Ticks gab
-# ============================================================
-def _has_defect_wait(
-    timelines: Dict[int, List[TimedNode]],
-    edge_timebands: List[Tuple[int, int, Set[frozenset]]],
-) -> bool:
+class HybridRotationRoutingPlanner(RoutingStrategy):
     """
-    Heuristik:
-    - Für jeden Tick (k -> k+1) schauen wir,
-      ob es defekte Kanten gibt UND ob kein Qubit seine Position ändert.
-    - Wenn ja, interpretieren wir das als "Warten wegen Defekt".
+    Hybrid router between RotationRoutingPlanner (diamonds) and
+    CircleRotationRoutingPlanner (8-cycles).
+
+    Behaviour (per current pair set = all qubits in this call):
+
+      1. Run RotationRoutingPlanner.route(...)
+      2. Compute defect-wait ticks *only for the current pair set* (here:
+         all qubits in `qubits`).
+         A defect-wait tick for a given set of qids means:
+           - there is at least one defective edge in that tick, AND
+           - none of those qids moved in that tick.
+      3. If there are **no** defect-wait ticks for that set, return the
+         Rotation result.
+      4. Otherwise, restore RNG state and run CircleRotationRoutingPlanner.
+      5. Again compute defect-wait ticks, but only over the same set of qids.
+         - If Circle has **no** defect waits for that set, use Circle.
+         - If both have defect waits, choose the one with fewer such ticks
+           (again, only counting them for this pair set).
+
+    Notes:
+      - "current pair(s)" in this top-level planner means: all qubits
+        involved in this Hybrid `route` call. The helper methods
+        `_has_defect_wait_for_qids` and `_count_defect_waits_for_qids`
+        are written so you can later call them for *individual pairs* or
+        *parallel groups of pairs* if you move the hybrid logic inside the
+        lower-level planners.
+      - This class does not mix both algorithms inside a single run; it
+        chooses which full plan (rotation vs circle) to use based on the
+        defect behaviour for the given qid subset.
     """
-    if not edge_timebands:
-        return False
 
-    T = len(edge_timebands)
-    qids = list(timelines.keys())
+    def __init__(
+        self,
+        rotation_cls: type[RotationRoutingPlanner] = RotationRoutingPlanner,
+        circle_cls: type[CircleRotationRoutingPlanner] = CircleRotationRoutingPlanner,
+    ) -> None:
+        self._rotation_cls = rotation_cls
+        self._circle_cls = circle_cls
 
-    # Wir gehen davon aus: für jedes qid hat timelines[qid] genau T+1 Einträge:
-    # t=0,1,...,T
-    for k in range(T):
-        _t0, _t1, defects = edge_timebands[k]
-        if not defects:
-            continue
-
-        any_moved = False
-        for qid in qids:
-            if k + 1 >= len(timelines[qid]):
-                continue
-            pos_before = timelines[qid][k][0]
-            pos_after = timelines[qid][k + 1][0]
-            if pos_before != pos_after:
-                any_moved = True
-                break
-
-        if not any_moved:
-            # Defekte Kanten vorhanden UND niemand bewegt sich -> Defekt-Warte-Tick
-            return True
-
-    return False
-
-
-class HybridRotationRoutingPlanner:
-    """
-    Hybrid-Router:
-
-    - Standard: Verhalten wie RotationRoutingPlanner (Diamonds).
-    - Wenn ein Paar im sequentiellen Fallback an einer defekten Kante blockiert
-      wird, wird im selben Algorithmus-Schritt versucht, einen Solo-Plan
-      mit Kreisen (8-Zyklen) zu finden (Circle-Variante).
-    - Falls das klappt, wird NUR für dieses Paar der Circle-Plan ausgeführt.
-      Danach geht es für andere Paare wieder normal mit Diamond-Rotation weiter.
-    - Falls auch der Circle-Plan nicht existiert, wird einfach gewartet
-      (Warteticks, bis Kanten wieder repariert wurden).
-    """
+    # ----------------- pair(s)-local defect detection -----------------
 
     @staticmethod
+    def _has_defect_wait_for_qids(
+        qids: Set[int],
+        timelines: Dict[int, List[TimedNode]],
+        edge_timebands: List[Tuple[int, int, Set[frozenset]]],
+    ) -> bool:
+        """
+        Returns True iff there is at least one tick with:
+          - defective edges present, AND
+          - none of the given qids moved in that tick.
+
+        This is a *local* version of the original _has_defect_wait, applied
+        only to the specified qids (current pair(s)), not to all qubits.
+        """
+        if not edge_timebands:
+            return False
+
+        T = len(edge_timebands)
+
+        # We assume timelines[qid] has length T+1 (t=0,...,T)
+        for k in range(T):
+            _t0, _t1, defects = edge_timebands[k]
+            if not defects:
+                continue
+
+            any_moved = False
+            for qid in qids:
+                # Safety guard: if timeline shorter than expected, skip that qid
+                if k + 1 >= len(timelines[qid]):
+                    continue
+                pos_before = timelines[qid][k][0]
+                pos_after = timelines[qid][k + 1][0]
+                if pos_before != pos_after:
+                    any_moved = True
+                    break
+
+            if not any_moved:
+                return True
+
+        return False
+
+    @staticmethod
+    def _count_defect_waits_for_qids(
+        qids: Set[int],
+        timelines: Dict[int, List[TimedNode]],
+        edge_timebands: List[Tuple[int, int, Set[frozenset]]],
+    ) -> int:
+        """
+        Counts how many ticks are defect-wait ticks *for the given qids only*.
+
+        A defect-wait tick for the subset `qids` is defined as:
+          - defective edges present in that tick, AND
+          - none of the qids in `qids` moves in that tick.
+        """
+        if not edge_timebands:
+            return 0
+
+        T = len(edge_timebands)
+        count = 0
+
+        for k in range(T):
+            _t0, _t1, defects = edge_timebands[k]
+            if not defects:
+                continue
+
+            any_moved = False
+            for qid in qids:
+                if k + 1 >= len(timelines[qid]):
+                    continue
+                pos_before = timelines[qid][k][0]
+                pos_after = timelines[qid][k + 1][0]
+                if pos_before != pos_after:
+                    any_moved = True
+                    break
+
+            if not any_moved:
+                count += 1
+
+        return count
+
+    # -------------------------- main API --------------------------
+
     def route(
+        self,
         G: nx.Graph,
         qubits: List[Qubit],
         pairs: List[Tuple[Qubit, Qubit]],
-        p_success: float = P_SUCCESS,
-        p_repair: float = P_REPAIR,
+        p_success: float,
+        p_repair: float,
+    ):
+        # The "current pair set" for this top-level planner is all qubits
+        # involved in this call.
+        current_qids: Set[int] = {q.id for q in qubits}
+
+        # Save RNG state so CircleRouting sees the same base random sequence
+        # (even though control flow diverges, this keeps runs reproducible).
+        rng_state_before = random.getstate()
+
+        # 1) Run RotationRoutingPlanner
+        rot_planner = self._rotation_cls()
+        timelines_rot, edge_timebands_rot = rot_planner.route(
+            G, qubits, pairs, p_success, p_repair
+        )
+
+        has_rot_wait = self._has_defect_wait_for_qids(
+            current_qids, timelines_rot, edge_timebands_rot
+        )
+
+        # If rotation has no defect-wait ticks for the current pair set,
+        # we simply return that plan.
+        if not has_rot_wait:
+            return timelines_rot, edge_timebands_rot
+
+        # 2) Rotation incurred defect-waits -> try CircleRouting for the
+        #    same pair set with the same initial RNG state.
+        random.setstate(rng_state_before)
+        circ_planner = self._circle_cls()
+        timelines_circ, edge_timebands_circ = circ_planner.route(
+            G, qubits, pairs, p_success, p_repair
+        )
+
+        has_circ_wait = self._has_defect_wait_for_qids(
+            current_qids, timelines_circ, edge_timebands_circ
+        )
+
+        # If Circle has no defect-waits for the current pair set, prefer it.
+        if not has_circ_wait:
+            return timelines_circ, edge_timebands_circ
+
+        # 3) Both variants have some defect-wait ticks for these qids:
+        #    choose the one with fewer such ticks (again only for these qids).
+        rot_waits = self._count_defect_waits_for_qids(
+            current_qids, timelines_rot, edge_timebands_rot
+        )
+        circ_waits = self._count_defect_waits_for_qids(
+            current_qids, timelines_circ, edge_timebands_circ
+        )
+
+        if circ_waits < rot_waits:
+            return timelines_circ, edge_timebands_circ
+
+        return timelines_rot, edge_timebands_rot
+
+
+
+class HybridRotationRoutingPlanner(RoutingStrategy):
+    """
+    Hybrid planner:
+
+    - Works like RotationRoutingPlanner by default (diamond-based rotations).
+    - When a **single pair** (sequential path) has to wait due to defective edges,
+      we *try* to switch only that pair to a circle-based (8-cycle) routing.
+
+      Concretely:
+        * In the sequential fallback for a pair, when a step fails (moved == False),
+          we attempt to build a circle-based SoloPlan for that pair
+          (using 8-cycles instead of 4-ciamond rotations).
+        * If a circle plan exists, we switch to that plan for the remainder of that pair.
+        * If not, we keep the original behavior (retry / wait).
+
+    - Different pairs can end up using different algorithms (diamonds vs circles).
+    """
+
+    def route(
+        self,
+        G: nx.Graph,
+        qubits: List[Qubit],
+        pairs: List[Tuple[Qubit, Qubit]],
+        p_success: float,
+        p_repair: float,
     ):
         # --- Zustand ---
         current_pos: Dict[int, Coord] = {q.id: q.pos for q in qubits}
         all_qids: Set[int] = {q.id for q in qubits}
 
         # Timelines
-        timelines: Dict[int, List[TimedNode]] = {q.id: [(current_pos[q.id], 0)] for q in qubits}
+        timelines: Dict[int, List[TimedNode]] = {
+            q.id: [(current_pos[q.id], 0)] for q in qubits
+        }
         t = 0  # globale Zeit
 
         defective_edges: Set[frozenset] = set()
@@ -812,11 +986,10 @@ class HybridRotationRoutingPlanner:
             edge_timebands.append((t - 1, t, set(defective_edges)))
             return moved
 
-        # ---------- Geometrie / Rauten / Kreise ----------
+        # ---------- Rauten/Rotation ----------
         def _is_diag(u: Coord, v: Coord) -> bool:
             return abs(u[0] - v[0]) == 1 and abs(u[1] - v[1]) == 1
 
-        # --- Diamond (RotationRoutingPlanner-Teil) ---
         def _diag_sn_neighbors(n: Coord) -> List[Coord]:
             if not _is_sn(n):
                 return []
@@ -852,18 +1025,110 @@ class HybridRotationRoutingPlanner:
             except nx.NetworkXNoPath:
                 return None
 
+        # ============================================================
+        #  LOOP / CIRCLE HELPERS (for circle-based fallback)
+        # ============================================================
+        def _canonical_loop_tuple(D: List[Coord]) -> Tuple[Coord, ...]:
+            return tuple(sorted(D))
+
+        def _rot_dir_loop(loop: List[Coord], u: Coord, v: Coord) -> int:
+            i = loop.index(u)
+            n = len(loop)
+            if loop[(i + 1) % n] == v:
+                return +1
+            elif loop[(i - 1) % n] == v:
+                return -1
+            else:
+                raise ValueError(f"{u}->{v} ist keine Nachbarschaft im Loop")
+
+        def _circle_for_edge(
+            u: Coord,
+            v: Coord,
+            target_lens: Tuple[int, ...] = (6, 8),
+        ) -> Optional[List[Coord]]:
+            """
+            Suche einen einfachen Zyklus der Länge in `target_lens` im SN-Subgraphen,
+            der die Kante (u, v) enthält, und KEINE defekten Kanten benutzt.
+
+            Strategie:
+            - Versuche zuerst einen Zyklus mit Länge 8 (Standard),
+            - falls keiner existiert, versuche einen 6-Zyklus.
+            - Gibt den ersten gefundenen Loop zurück.
+
+            Rückgabeformat: [u, v, ..., node] – zyklische Liste der Knoten.
+            """
+            if not (_is_sn(u) and _is_sn(v)):
+                return None
+            if not SN.has_edge(u, v):
+                return None
+
+            # Die Kante (u, v) selbst darf nicht defekt sein
+            if _edgeset(u, v) in defective_edges:
+                return None
+
+            for target_len in target_lens:
+                start = v
+                max_nodes = target_len
+
+                # BFS mit Längenbegrenzung auf max_nodes Knoten (inkl. u)
+                queue: deque[Tuple[Coord, List[Coord]]] = deque()
+                queue.append((start, [start]))
+
+                while queue:
+                    node, path = queue.popleft()
+
+                    if len(path) >= max_nodes:
+                        continue
+
+                    for w in SN.neighbors(node):
+                        # Kante (node, w) darf nicht defekt sein
+                        if _edgeset(node, w) in defective_edges:
+                            continue
+
+                        if w == u:
+                            # Abschluss-Kante (node, u) darf nicht defekt sein
+                            if _edgeset(node, u) in defective_edges:
+                                continue
+
+                            full_path = path + [u]  # [v, ..., node, u]
+                            if len(full_path) == max_nodes:
+                                loop = [u] + path  # [u, v, ..., node]
+                                return loop
+                            else:
+                                continue
+
+                        if w in path or w == u:
+                            continue
+
+                        if len(path) + 1 <= max_nodes:
+                            queue.append((w, path + [w]))
+
+            return None
+
+
         # ---------- Solo-Plan für ein Paar ----------
         class SoloStep:
-            __slots__ = ("updates_pair_only", "sample", "diamonds")
+            __slots__ = ("updates_pair_only", "sample", "diamonds")  # diamonds: List[(loop, dir)]
 
-            def __init__(self, updates_pair_only: Dict[int, Coord], sample: bool,
-                         diamonds: List[Tuple[List[Coord], int]]):
+            def __init__(
+                self,
+                updates_pair_only: Dict[int, Coord],
+                sample: bool,
+                diamonds: List[Tuple[List[Coord], int]],
+            ):
                 self.updates_pair_only = updates_pair_only
                 self.sample = sample
-                # diamonds: Liste (Loop/Diamond, Richtung), wird zur Laufzeit expandiert
-                self.diamonds = diamonds
+                self.diamonds = diamonds  # hier: allgemeine Loops oder Diamonds
 
         class SoloPlan:
+            """
+            - ticks: Liste SoloStep
+            - pos_trace: qid -> [pos_t0, pos_t1, ..., pos_tN] (nur für die zwei Qubits des Paars)
+            - used_diamonds: Menge kanonischer Diamond-/Loop-Knoten-Tupel (nur informativ)
+            - in_idx: Index des IN-Hops im Tick-Array (oder None)
+            - out_idx: Index des OUT-Hops (oder None)
+            """
+
             def __init__(
                 self,
                 ticks: List[SoloStep],
@@ -882,10 +1147,10 @@ class HybridRotationRoutingPlanner:
             def length(self) -> int:
                 return len(self.ticks)
 
-        def _canonical_diamond_tuple(D: List[Coord]) -> Tuple[Coord, ...]:
+        def _canonical_diamond_tuple(D: List[Coord]) -> Tuple[Coord, Coord, Coord, Coord]:
             return tuple(sorted(D))
 
-        # --- Diamond-Rotationsupdates (für Standard-Router) ---
+        # ---------- ROTATION-SOLOPLAN (Diamonds) ----------
         def _compute_pair_rotation_updates_for_diamond(
             diamond: List[Coord],
             direction: int,
@@ -902,8 +1167,7 @@ class HybridRotationRoutingPlanner:
                 out[b_id] = diamond[(idx[lb] + direction) % 4]
             return out
 
-        # ---------- Diamond-Solo-Plan (RotationRoutingPlanner-Logik) ----------
-        def _plan_pair_solo(a_id: int, b_id: int) -> Optional[SoloPlan]:
+        def _plan_pair_solo_rotation(a_id: int, b_id: int) -> Optional[SoloPlan]:
             la = current_pos[a_id]
             lb = current_pos[b_id]
             if not (_is_sn(la) and _is_sn(lb)):
@@ -978,7 +1242,10 @@ class HybridRotationRoutingPlanner:
                                 dB, dirB, a_id, b_id, la, lb
                             )
                             updB[b_id] = vB
-                            if not (diamonds_for_step and set(diamonds_for_step[0][0]).intersection(dB)):
+                            if not (
+                                diamonds_for_step
+                                and set(diamonds_for_step[0][0]).intersection(dB)
+                            ):
                                 updates.update(updB)
                                 diamonds_for_step.append((dB, dirB))
                                 used_diamonds.add(_canonical_diamond_tuple(dB))
@@ -1031,59 +1298,7 @@ class HybridRotationRoutingPlanner:
 
             return SoloPlan(ticks, trace, used_diamonds, in_idx, out_idx)
 
-        # ---------- Circle-spezifische Teile ----------
-        def _canonical_loop_tuple(D: List[Coord]) -> Tuple[Coord, ...]:
-            return tuple(sorted(D))
-
-        def _rot_dir_loop(loop: List[Coord], u: Coord, v: Coord) -> int:
-            i = loop.index(u)
-            n = len(loop)
-            if loop[(i + 1) % n] == v:
-                return +1
-            elif loop[(i - 1) % n] == v:
-                return -1
-            else:
-                raise ValueError(f"{u}->{v} ist keine Nachbarschaft im Loop")
-
-        def _circle_for_edge(u: Coord, v: Coord, target_len: int = 8) -> Optional[List[Coord]]:
-            """
-            Suche einen einfachen Zyklus der Länge `target_len` im SN-Subgraphen,
-            der die Kante (u, v) enthält.
-            Rückgabeformat: [u, v, ..., node] – zyklische Liste der Knoten.
-            """
-            if not (_is_sn(u) and _is_sn(v)):
-                return None
-            if not SN.has_edge(u, v):
-                return None
-
-            start = v
-            max_nodes = target_len
-
-            # DFS mit Längenbegrenzung
-            stack: List[Tuple[Coord, List[Coord]]] = [(start, [start])]
-            while stack:
-                node, path = stack.pop()
-                if len(path) >= max_nodes:
-                    continue
-
-                for w in SN.neighbors(node):
-                    if w == u:
-                        full_path = path + [u]  # [v, ..., node, u]
-                        if len(full_path) == max_nodes:
-                            # Zyklus-Order: [u, v, ..., node]
-                            loop = [u] + path
-                            return loop
-                        else:
-                            continue
-
-                    if w in path or w == u:
-                        continue
-
-                    if len(path) + 1 <= max_nodes:
-                        stack.append((w, path + [w]))
-
-            return None
-
+        # ---------- CIRCLE-SOLOPLAN (8-Zyklen) ----------
         def _compute_pair_rotation_updates_for_loop(
             loop: List[Coord],
             direction: int,
@@ -1095,15 +1310,17 @@ class HybridRotationRoutingPlanner:
             idx = {p: i for i, p in enumerate(loop)}
             out: Dict[int, Coord] = {}
             n = len(loop)
-
             if la in idx:
                 out[a_id] = loop[(idx[la] + direction) % n]
             if lb in idx:
                 out[b_id] = loop[(idx[lb] + direction) % n]
             return out
 
-        # ---------- Circle-Solo-Plan für EIN Paar ----------
         def _plan_pair_solo_circle(a_id: int, b_id: int) -> Optional[SoloPlan]:
+            """
+            Circle-based variant of _plan_pair_solo_rotation for the *current* positions.
+            Uses 8-cycles instead of diamonds. Same IN/OUT semantics.
+            """
             la = current_pos[a_id]
             lb = current_pos[b_id]
             if not (_is_sn(la) and _is_sn(lb)):
@@ -1145,7 +1362,7 @@ class HybridRotationRoutingPlanner:
             idxA = 0
             idxB = 0
 
-            # bis PRE-A/B, mit Loops
+            # bis PRE-A/B
             while la != preA or lb != preB:
                 updates: Dict[int, Coord] = {}
                 loops_for_step: List[Tuple[List[Coord], int]] = []
@@ -1178,7 +1395,10 @@ class HybridRotationRoutingPlanner:
                                 loopB, dirB, a_id, b_id, la, lb
                             )
                             updB[b_id] = vB
-                            if not (loops_for_step and set(loops_for_step[0][0]).intersection(loopB)):
+                            if not (
+                                loops_for_step
+                                and set(loops_for_step[0][0]).intersection(loopB)
+                            ):
                                 updates.update(updB)
                                 loops_for_step.append((loopB, dirB))
                                 used_loops.add(_canonical_loop_tuple(loopB))
@@ -1203,7 +1423,7 @@ class HybridRotationRoutingPlanner:
                     SoloStep(
                         updates_pair_only=updates,
                         sample=True,
-                        diamonds=loops_for_step,  # hier: Loops, aber gleiche Struktur
+                        diamonds=loops_for_step,  
                     )
                 )
                 trace[a_id].append(la)
@@ -1231,7 +1451,7 @@ class HybridRotationRoutingPlanner:
 
             return SoloPlan(ticks, trace, used_loops, in_idx, out_idx)
 
-        # ---------- Kompatibilität der Solo-Pläne (Diamonds) ----------
+        # ---------- Kompatibilität der Solo-Pläne ----------
         def _plans_compatible_distance(
             p1: SoloPlan,
             ab1: Tuple[int, int],
@@ -1259,12 +1479,16 @@ class HybridRotationRoutingPlanner:
             return True
 
         def _plans_compatible_diamonds(p1: SoloPlan, p2: SoloPlan) -> bool:
+            """
+            Zwei Solo-Pläne sind diamond/loop-kompatibel, wenn sie in keinem Tick
+            *gleichzeitig* dieselbe Diamond / denselben Loop benutzen.
+            """
             L = max(p1.length, p2.length)
 
             for i in range(L):
                 if i < p1.length:
                     d1 = {
-                        _canonical_diamond_tuple(D)
+                        tuple(sorted(D))
                         for (D, _dir) in p1.ticks[i].diamonds
                     }
                 else:
@@ -1272,7 +1496,7 @@ class HybridRotationRoutingPlanner:
 
                 if i < p2.length:
                     d2 = {
-                        _canonical_diamond_tuple(D)
+                        tuple(sorted(D))
                         for (D, _dir) in p2.ticks[i].diamonds
                     }
                 else:
@@ -1356,6 +1580,10 @@ class HybridRotationRoutingPlanner:
             pair_order[pid] = idx
 
         def _is_ready_pair(pid: Tuple[int, int], remaining_pids: Set[Tuple[int, int]]) -> bool:
+            """
+            Ein Paar ist 'ready', wenn es für beide Qubits kein früheres
+            (im Sinne der pairs-Liste) verbleibendes Paar gibt, das dieses Qubit enthält.
+            """
             idx = pair_order[pid]
             a, b = pid
             for other in remaining_pids:
@@ -1368,23 +1596,23 @@ class HybridRotationRoutingPlanner:
                         return False
             return True
 
-        # ===================== Hauptroutine =====================
+        # ===================== Hauptroutine mit Ordnungs-Constraint =====================
         remaining: Set[Tuple[int, int]] = {(qa.id, qb.id) for qa, qb in pairs}
 
         while remaining:
             # 1) Nur "ready" Paare dürfen in diesem Durchlauf geplant werden
             ready_pids = [pid for pid in remaining if _is_ready_pair(pid, remaining)]
 
-            # Failsafe
+            # Failsafe: falls wegen inkonsistenter Daten nichts ready ist, nimm alles
             if not ready_pids:
                 ready_pids = list(remaining)
 
-            # 2) Solo-Pläne für ready-Paare (Diamond)
+            # 2) Solo-Pläne für ready-Paare (immer zunächst ROTATION)
             plans: Dict[Tuple[int, int], SoloPlan] = {}
             sequential_fallback: List[Tuple[int, int]] = []
             for pid in sorted(ready_pids, key=lambda p: pair_order[p]):
                 a, b = pid
-                plan = _plan_pair_solo(a, b)
+                plan = _plan_pair_solo_rotation(a, b)
                 if plan is None:
                     sequential_fallback.append((a, b))
                 else:
@@ -1399,12 +1627,13 @@ class HybridRotationRoutingPlanner:
 
             something_finished = False
 
+            # ---------- PARALLEL-TEIL: unverändert wie RotationRouting ----------
             for grp in groups:
                 group_qids: Set[int] = {x for ab in grp for x in ab}
                 L = max(plans[pid].length for pid in grp) if grp else 0
                 parallel_failed = False
 
-                # --- Parallel-Replay MIT Retry bei Defekt (Diamond) ---
+                # --- Parallel-Replay MIT Retry bei Defekt ---
                 step = 0
                 while step < L:
                     updates_pair_only: Dict[int, Coord] = {}
@@ -1443,6 +1672,7 @@ class HybridRotationRoutingPlanner:
                                 [],
                             )
 
+                        # Kollision gleicher Qubits?
                         if set(updates_pair_only.keys()) & set(s.updates_pair_only.keys()):
                             conflict = True
                             break
@@ -1466,120 +1696,125 @@ class HybridRotationRoutingPlanner:
 
                     moved = _commit_tick(updates, sample=do_sample)
                     if moved:
+                        # IN-Hop(e) dieses Steps waren erfolgreich -> PREs jetzt fest übernehmen
                         for pid, pre in pending_live_pre.items():
                             live_pre_by_pair[pid] = pre
-                        step += 1
+                        step += 1  # NÄCHSTER Step
                     else:
-                        # Defekt -> RETRY gleicher Step
+                        # Defekt -> RETRY gleicher Step im nächsten Tick
                         continue
 
                 if parallel_failed:
-                    # --- Sequentieller Fallback MIT Hybrid-Logik ---
+                    # --- Sequentieller Fallback MIT Retry bei Defekt (Hybrid-Logik kommt hier) ---
                     for pid in grp:
                         plan = plans[pid]
                         a_id, b_id = pid
-                        step = 0
-                        while step < plan.length:
-                            s = plan.ticks[step]
-                            # IN-Hop -> PRE vor Commit zwischenspeichern
-                            pending_pre = None
-                            if plan.in_idx is not None and step == plan.in_idx:
-                                pending_pre = {
-                                    a_id: current_pos[a_id],
-                                    b_id: current_pos[b_id],
-                                }
 
-                            # OUT-Hop -> live PRE
-                            if plan.out_idx is not None and step == plan.out_idx:
-                                pre_map = live_pre_by_pair.get(
-                                    pid,
-                                    {a_id: current_pos[a_id], b_id: current_pos[b_id]},
-                                )
-                                s = SoloStep(
-                                    {a_id: pre_map[a_id], b_id: pre_map[b_id]},
-                                    False,
-                                    [],
-                                )
+                        # Hybrid: wir halten Flags, ob wir bereits auf Kreise gewechselt haben
+                        use_circle = False
+                        tried_circle = False
 
-                            updates = _expand_runtime_rotations(
-                                s.updates_pair_only,
-                                s.diamonds,
-                            )
-
-                            moved = _commit_tick(updates, sample=s.sample)
-
-                            if moved:
-                                if pending_pre is not None:
-                                    live_pre_by_pair[pid] = pending_pre
-                                step += 1
-                            else:
-                                # --- Hier: Blockade durch Defekt für dieses Paar? ---
-                                if s.updates_pair_only:
-                                    # Versuche Circle-Plan NUR für dieses Paar
-                                    circle_plan = _plan_pair_solo_circle(a_id, b_id)
-
-                                    if circle_plan is None:
-                                        # Kein Circle-Plan -> einfach warten
-                                        # (der obige _commit_tick war schon ein Wartetick)
-                                        continue
-                                    else:
-                                        # Circle-Plan sequentiell ausführen
-                                        step_c = 0
-                                        while step_c < circle_plan.length:
-                                            sc = circle_plan.ticks[step_c]
-                                            pending_pre_c = None
-                                            if circle_plan.in_idx is not None and step_c == circle_plan.in_idx:
-                                                pending_pre_c = {
-                                                    a_id: current_pos[a_id],
-                                                    b_id: current_pos[b_id],
-                                                }
-                                            if circle_plan.out_idx is not None and step_c == circle_plan.out_idx:
-                                                pre_map_c = live_pre_by_pair.get(
-                                                    pid,
-                                                    {a_id: current_pos[a_id], b_id: current_pos[b_id]},
-                                                )
-                                                sc = SoloStep(
-                                                    {a_id: pre_map_c[a_id], b_id: pre_map_c[b_id]},
-                                                    False,
-                                                    [],
-                                                )
-
-                                            updates_c = _expand_runtime_rotations(
-                                                sc.updates_pair_only,
-                                                sc.diamonds,
-                                            )
-                                            moved_c = _commit_tick(updates_c, sample=sc.sample)
-                                            if moved_c:
-                                                if pending_pre_c is not None:
-                                                    live_pre_by_pair[pid] = pending_pre_c
-                                                step_c += 1
-                                            else:
-                                                # Defekt auch im Circle-Plan -> RETRY selben Step
-                                                continue
-
-                                        # Paar ist über Circle fertig -> Diamond-Plan als "abgeschlossen" markieren
-                                        step = plan.length
-
+                        # Hinweis: Wir starten zunächst mit dem vorhandenen ROTATIONS-Plan.
+                        while True:
+                            if plan is None and not tried_circle:
+                                # Kein Rotationsplan? -> Versuche direkt Circle-Plan
+                                tried_circle = True
+                                plan = _plan_pair_solo_circle(a_id, b_id)
+                                if plan is not None:
+                                    use_circle = True
+                                    # Frisch starten mit diesem Plan
+                                    step = 0
                                 else:
-                                    # keine Updates -> normaler Wartetick
-                                    continue
+                                    # Weder Rotations- noch Circle-Plan -> warten
+                                    _commit_tick({}, sample=True)
+                                    break
 
-                # Gruppe abgeschlossen -> Paare entfernen und REPLAN starten
+                            if plan is None:
+                                _commit_tick({}, sample=True)
+                                break
+
+                            step = 0
+                            while step < plan.length:
+                                s = plan.ticks[step]
+                                # IN-Hop -> PRE vor Commit zwischenspeichern, aber erst bei Erfolg übernehmen
+                                pending_pre = None
+                                if plan.in_idx is not None and step == plan.in_idx:
+                                    pending_pre = {
+                                        a_id: current_pos[a_id],
+                                        b_id: current_pos[b_id],
+                                    }
+
+                                # OUT-Hop -> live PRE nutzen
+                                if plan.out_idx is not None and step == plan.out_idx:
+                                    pre_map = live_pre_by_pair.get(
+                                        pid,
+                                        {
+                                            a_id: current_pos[a_id],
+                                            b_id: current_pos[b_id],
+                                        },
+                                    )
+                                    s = SoloStep(
+                                        {a_id: pre_map[a_id], b_id: pre_map[b_id]},
+                                        False,
+                                        [],
+                                    )
+
+                                updates = _expand_runtime_rotations(
+                                    s.updates_pair_only,
+                                    s.diamonds,
+                                )
+                                moved = _commit_tick(updates, sample=s.sample)
+                                if moved:
+                                    if pending_pre is not None:
+                                        live_pre_by_pair[pid] = pending_pre
+                                    step += 1
+                                else:
+                                    # Defekt -> Hybrid-Fallback:
+                                    #   Falls wir noch nicht auf Kreise gewechselt haben,
+                                    #   versuche einen Circle-SoloPlan von der *aktuellen* Position.
+                                    if (not use_circle) and (not tried_circle):
+                                        tried_circle = True
+                                        circle_plan = _plan_pair_solo_circle(a_id, b_id)
+                                        if circle_plan is not None:
+                                            use_circle = True
+                                            plan = circle_plan
+                                            # Neustart des Paars mit Circle-Plan
+                                            step = 0
+                                            continue
+                                    # Wenn kein Circle-Plan möglich oder schon im Circle-Plan:
+                                    #   -> Originalverhalten: RETRY selben Step (d.h. Warten)
+                                    continue
+                            break  # Plan für dieses Pair abgearbeitet
+
+                    # Gruppe abgeschlossen -> Paare entfernen und REPLAN starten
                 for pid in grp:
                     if pid in remaining:
                         remaining.remove(pid)
                 something_finished = True
                 break  # replan
 
-            # Nichts fertig geworden -> sequential_fallback (ein ready Paar), mit Hybrid-Logik
+            # ---------- SEQUENTIELLER FALLBACK (ready, aber kein Plan in parallel) ----------
             if not something_finished:
                 if sequential_fallback:
                     a, b = sequential_fallback[0]
-                    plan = _plan_pair_solo(a, b)
+                    pid = (a, b)
+
+                    # Zunächst Rotationsplan für dieses Paar
+                    plan = _plan_pair_solo_rotation(a, b)
+
+                    use_circle = False
+                    tried_circle = False
+
+                    # Wenn Rotation keinen Plan liefert -> direkt versuchen, Circle-Plan zu nutzen
                     if plan is None:
+                        plan = _plan_pair_solo_circle(a, b)
+                        if plan is not None:
+                            use_circle = True
+
+                    if plan is None:
+                        # weder Rotations- noch Circle-Plan -> warten
                         _commit_tick({}, sample=True)
                     else:
-                        pid = (a, b)
                         step = 0
                         while step < plan.length:
                             s = plan.ticks[step]
@@ -1609,48 +1844,20 @@ class HybridRotationRoutingPlanner:
                                     live_pre_by_pair[pid] = pending_pre
                                 step += 1
                             else:
-                                # Blockade? -> Circle versuchen
-                                if s.updates_pair_only:
+                                # Hier sitzt der **Hybrid-Kern**:
+                                #   Rotation hat wegen Defekt warten müssen.
+                                #   Versuche jetzt EINMAL, einen Circle-Plan zu bauen und umzuschalten.
+                                if (not use_circle) and (not tried_circle):
+                                    tried_circle = True
                                     circle_plan = _plan_pair_solo_circle(a, b)
-                                    if circle_plan is None:
-                                        # kein Circle-Plan -> warten
+                                    if circle_plan is not None:
+                                        use_circle = True
+                                        plan = circle_plan
+                                        step = 0
                                         continue
-                                    else:
-                                        step_c = 0
-                                        while step_c < circle_plan.length:
-                                            sc = circle_plan.ticks[step_c]
-                                            pending_pre_c = None
-                                            if circle_plan.in_idx is not None and step_c == circle_plan.in_idx:
-                                                pending_pre_c = {
-                                                    a: current_pos[a],
-                                                    b: current_pos[b],
-                                                }
-                                            if circle_plan.out_idx is not None and step_c == circle_plan.out_idx:
-                                                pre_map_c = live_pre_by_pair.get(
-                                                    pid,
-                                                    {a: current_pos[a], b: current_pos[b]},
-                                                )
-                                                sc = SoloStep(
-                                                    {a: pre_map_c[a], b: pre_map_c[b]},
-                                                    False,
-                                                    [],
-                                                )
-
-                                            updates_c = _expand_runtime_rotations(
-                                                sc.updates_pair_only,
-                                                sc.diamonds,
-                                            )
-                                            moved_c = _commit_tick(updates_c, sample=sc.sample)
-                                            if moved_c:
-                                                if pending_pre_c is not None:
-                                                    live_pre_by_pair[pid] = pending_pre_c
-                                                step_c += 1
-                                            else:
-                                                continue
-
-                                        step = plan.length
-                                else:
-                                    continue
+                                # Wenn kein Circle-Plan oder bereits im Circle-Plan:
+                                #   -> Originalverhalten: RETRY selben Step (d.h. Warten)
+                                continue
 
                     if (a, b) in remaining:
                         remaining.remove((a, b))

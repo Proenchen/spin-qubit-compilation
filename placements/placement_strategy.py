@@ -1,67 +1,21 @@
-import random
-import networkx as nx
-
+from __future__ import annotations
+from abc import ABC, abstractmethod
 from typing import List, Tuple, Optional
+
+import networkx as nx
+import random
 from routing.common import Qubit
+from utils.network import NetworkBuilder
 
+class PlacementStrategy(ABC):
+    """Strategie-Interface für Qubit-Platzierung + Paarerzeugung."""
 
-class NetworkBuilder:
-    """Builds tiled 8-neighborhood graphs with typed nodes (IN/SN)."""
-
-    @staticmethod
-    def build_network(width: int, height: int) -> nx.Graph:
-        """
-        Create a width x height tiling of the 8-node pattern (no center),
-        connected with 8-neighborhood edges. Node attribute 'type' ∈ {'IN','SN'}.
-        Corners are 'IN'; others are 'SN'.
-
-        Coordinates follow the original convention:
-        - Each tile is offset by +2 in x for columns
-        - Each tile is offset by -2 in y for rows (so rows go downward)
-        """
-        if not (isinstance(width, int) and isinstance(height, int) and width >= 1 and height >= 1):
-            raise ValueError("width and height must be integers >= 1")
-
-        # Single-tile template (no center)
-        template_pos = {
-            0: (-1,  1), 1: (0, 1),  2: (1, 1),
-            3: (-1,  0),             4: (1, 0),
-            5: (-1, -1), 6: (0, -1), 7: (1, -1),
-        }
-        corners = {0, 2, 5, 7}
-
-        G = nx.Graph()
-
-        # Place tiles in a width x height grid
-        for j in range(height):         # rows
-            for i in range(width):      # columns
-                dx, dy = 2 * i, -2 * j  # keep original spacing/orientation
-                for t_id, (x, y) in template_pos.items():
-                    coord = (x + dx, y + dy)
-                    if coord not in G:
-                        G.add_node(coord, type=("IN" if t_id in corners else "SN"))
-
-        # Connect 8-neighborhood across the entire tiled grid
-        coords = list(G.nodes())
-        coord_set = set(coords)
-        for (x, y) in coords:
-            for ddx in (-1, 0, 1):
-                for ddy in (-1, 0, 1):
-                    if ddx == 0 and ddy == 0:
-                        continue
-                    v = (x + ddx, y + ddy)
-                    if v in coord_set:
-                        G.add_edge((x, y), v)
-
-        return G
-
-    @staticmethod
-    def place_qubits_and_make_pairs(
+    def build_network_and_place(
+        self,
         width: int,
         height: int,
         n_qubits: int,
-        *,
-        rounds: int = 6,
+        rounds: int,
         max_pairs_per_round: Optional[int] = None,
         seed: Optional[int] = None,
     ) -> Tuple[nx.Graph, List[Qubit], List[Tuple[Qubit, Qubit]]]:
@@ -93,7 +47,7 @@ class NetworkBuilder:
             raise ValueError(f"n_qubits={n_qubits} exceeds available SN nodes ({len(sn_nodes)}).")
 
         # 3) Qubits zufällig platzieren (ohne Wiederholung)
-        chosen_coords = rng.sample(sn_nodes, n_qubits)
+        chosen_coords = self.place_qubits(sn_nodes, n_qubits, seed)
         qubits = [Qubit(i, coord) for i, coord in enumerate(chosen_coords)]
 
         # 4) Zufällige Paarfolge erzeugen (rundenweise, disjunkte Paare pro Runde)
@@ -113,3 +67,16 @@ class NetworkBuilder:
                 pairs.append((a, b))
 
         return G, qubits, pairs
+
+    @abstractmethod
+    def place_qubits(
+        self,
+        sn_nodes: List[Tuple[int, int]],
+        n_qubits: int,
+        seed: Optional[int] = None,
+    ) -> List[Tuple[int, int]]:
+        """
+        Wählt aus allen SN-Nodes diejenigen Koordinaten aus,
+        auf denen Qubits platziert werden sollen.
+        """
+        pass

@@ -5,14 +5,13 @@ import random
 import networkx as nx
 
 from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubit
+from routing.routing_strategy import RoutingStrategy
 
-P_SUCCESS = 0.98
-P_REPAIR = 0.8
 MAX_REPLANS = 8
 MAX_GLOBAL_ITERS = 8
 
 
-class DefaultRoutingPlanner:
+class DefaultRoutingPlanner(RoutingStrategy):
     """
     Routing in Layern mit (1) Auswahl bester Meeting-INs rein nach Layer,
     (2) gezielter Evakuierung blockierender Non-Layer, (3) Sampling persistenter
@@ -29,13 +28,13 @@ class DefaultRoutingPlanner:
     """
 
     # ---------- Öffentliche Hauptfunktion ----------
-    @staticmethod
     def route(
+        self,
         G: nx.Graph,
         qubits: List[Qubit],
         pairs: List[Tuple[Qubit, Qubit]],
-        p_success: float = P_SUCCESS,
-        p_repair: float = P_REPAIR,
+        p_success: float,
+        p_repair: float,
     ):
         # Zustand
         current_pos: Dict[int, Coord] = {q.id: q.pos for q in qubits}

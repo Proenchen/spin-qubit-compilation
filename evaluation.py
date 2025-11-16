@@ -23,7 +23,7 @@ from typing import Dict, List, Tuple, Set, Optional
 from routing.routing_with_reroute import RerouteRoutingPlanner 
 from routing.default_routing import DefaultRoutingPlanner
 from routing.common import Qubit, TimedNode
-from routing.network import NetworkBuilder
+from utils.network import NetworkBuilder
 
 import networkx as nx
 import pandas as pd

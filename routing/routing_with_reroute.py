@@ -3,30 +3,28 @@ from typing import Dict, List, Optional, Tuple, Set
 from copy import deepcopy
 import networkx as nx
 
-from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubit
+from routing.common import Coord, MAX_TIME, Reservations, TimedNode, Qubit
 from routing.default_routing import DefaultRoutingPlanner
+from routing.routing_strategy import RoutingStrategy
 
-P_SUCCESS = 1
-P_REPAIR = 0.25
 MAX_REPLANS = 50
 MAX_GLOBAL_ITERS = 50
 
 
-class RerouteRoutingPlanner(DefaultRoutingPlanner):
+class RerouteRoutingPlanner(DefaultRoutingPlanner, RoutingStrategy):
     """
     Variante: Nach Schritt 3 wird bei *jedem* festgestellten Defekt zuerst
     im selben Layer eine kollisionsfreie Neuplanung versucht, die dieselben
     Ziele (Evakuierungs-Ziel-SN bzw. Meeting-IN) beibehält und defekte Kanten vermeidet.
     Nur wenn das nicht möglich ist, werden die betroffenen Paare in ein Spillover-Layer verschoben.
     """
-
-    @staticmethod
     def route(
+        self,
         G: nx.Graph,
         qubits: List[Qubit],
         pairs: List[Tuple[Qubit, Qubit]],
-        p_success: float = P_SUCCESS,
-        p_repair: float = P_REPAIR,
+        p_success: float,
+        p_repair: float,
     ):
         # --- Zustand ---
         current_pos: Dict[int, Coord] = {q.id: q.pos for q in qubits}

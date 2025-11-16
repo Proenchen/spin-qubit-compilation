@@ -2,46 +2,42 @@ import random
 
 from typing import List, Tuple
 from routing.common import Qubit
-from routing.network import NetworkBuilder
+from utils.network import NetworkBuilder
+from routing.routing_strategy import RoutingStrategy
 from routing.routing_with_reroute import RerouteRoutingPlanner
 from routing.default_routing import DefaultRoutingPlanner
 from routing.rotation_routing import RotationRoutingPlanner
 from routing.rotation_bypass_routing import HybridRotationRoutingPlanner, CircleRotationRoutingPlanner
-from utils.animation import animate_mapf
+from placements.placement_strategy import PlacementStrategy
+from placements.random_strategy import RandomPlacementStrategy
+from simulation import SimulationConfig, RoutingSimulator
+
 
 if __name__ == "__main__":
+
+    placement: PlacementStrategy = RandomPlacementStrategy()
+    routing: RoutingStrategy = HybridRotationRoutingPlanner()
+
+    # For defective edges
     random.seed(5)
-    G, qubits, pairs = NetworkBuilder.place_qubits_and_make_pairs(
+
+    config = SimulationConfig(
         width=3,
         height=3,
         n_qubits=24,
         rounds=3,
-        seed=8,  
-    )
-    """ qubits: List[Qubit] = [
-        Qubit(0, (2, -3)),
-        Qubit(1, (1,  0)),
-        Qubit(2, (-1, 0)),
-        Qubit(3, (2, -1)),
-        Qubit(4, (-1, -2)),
-        Qubit(5, (2,  1)),
-    ]
+        p_success=0.99,
+        p_repair=0.05,
 
-    pairs: List[Tuple[Qubit, Qubit]] = [
-        (qubits[2], qubits[3]),  #1
-        (qubits[0], qubits[2]),  #2
-        (qubits[2], qubits[3]),  #3
-        (qubits[4], qubits[5]),  #3
-        (qubits[0], qubits[2]),  #4
-        (qubits[1], qubits[4]),  #4
-        (qubits[3], qubits[5]),  #4
-        (qubits[0], qubits[5]),  #5
-        (qubits[1], qubits[3]),  #5
-        (qubits[4], qubits[5]),  #6 
-    ] 
- """
-    #planner = DefaultRoutingPlanner()
-    #planner = RerouteRoutingPlanner()
-    planner = HybridRotationRoutingPlanner()
-    timelines, edge_timebands = planner.route(G, qubits, pairs)
-    animate_mapf(G, timelines, edge_timebands=edge_timebands, smooth=True)
+        # For Qubit-Placement and interactions
+        seed=42
+    )
+
+    simulator = RoutingSimulator(
+        placement_strategy=placement,
+        routing_strategy=routing,
+        config=config,
+    )
+
+    simulator.run()
+    

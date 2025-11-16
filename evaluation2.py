@@ -1091,7 +1091,7 @@ import matplotlib.pyplot as plt
 
 # ---- Imports from your codebase ----
 from routing.common import Qubit, TimedNode
-from routing.network import NetworkBuilder
+from utils.network import NetworkBuilder
 
 from routing.default_routing import DefaultRoutingPlanner as _DefaultRoutingPlanner
 from routing.rotation_routing import RotationRoutingPlanner as _RotationRoutingPlanner
