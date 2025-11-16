@@ -11,12 +11,13 @@ from routing.rotation_bypass_routing import HybridRotationRoutingPlanner, Circle
 from placements.placement_strategy import PlacementStrategy
 from placements.random_strategy import RandomPlacementStrategy
 from placements.reverse_traversal_strategy import ReverseTraversalPlacementStrategy
+from placements.interaction_placement_strategy import InteractionPlacementStrategy
 from simulation import SimulationConfig, RoutingSimulator
 
 
 if __name__ == "__main__":
 
-    placement: PlacementStrategy = ReverseTraversalPlacementStrategy()
+    placement: PlacementStrategy = InteractionPlacementStrategy()
     routing: RoutingStrategy = HybridRotationRoutingPlanner()
 
     # For defective edges
