@@ -776,6 +776,88 @@ def evaluate_runtimes_for_strategies_3x3(
 
     return runtimes
 
+def save_results_csv_expectation(
+    path: str,
+    expectations: List[float],
+    strategy_name: str,
+    timesteps_mean: List[float],
+    movements_mean: List[float],
+    n_qubits: int,
+    n_samples: int,
+    width: int,
+    height: int,
+    rounds: int,
+    min_expectation: float,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(
+                [
+                    "strategy",
+                    "expectation",
+                    "timesteps_mean",
+                    "movements_mean",
+                    "n_qubits",
+                    "n_samples",
+                    "width",
+                    "height",
+                    "rounds",
+                    "min_expectation",
+                ]
+            )
+        for i, E in enumerate(expectations):
+            writer.writerow(
+                [
+                    strategy_name,
+                    E,
+                    timesteps_mean[i],
+                    movements_mean[i],
+                    n_qubits,
+                    n_samples,
+                    width,
+                    height,
+                    rounds,
+                    min_expectation,
+                ]
+            )
+
+
+def load_results_csv_expectation(path: str) -> Dict[str, Dict[float, Dict[str, float]]]:
+    """
+    Rückgabe:
+      data[strategy][expectation] = {
+        'timesteps_mean': ..., 'movements_mean': ...,
+        'n_qubits': ..., 'n_samples': ...,
+        'width': ..., 'height': ..., 'rounds': ..., 'min_expectation': ...
+      }
+    """
+    data: Dict[str, Dict[float, Dict[str, float]]] = {}
+    if not os.path.exists(path):
+        return data
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            strat = row["strategy"]
+            E = float(row["expectation"])
+            data.setdefault(strat, {})
+            data[strat][E] = {
+                "timesteps_mean": float(row["timesteps_mean"]),
+                "movements_mean": float(row["movements_mean"]),
+                "n_qubits": int(float(row["n_qubits"])),
+                "n_samples": int(float(row["n_samples"])),
+                "width": int(float(row["width"])),
+                "height": int(float(row["height"])),
+                "rounds": int(float(row["rounds"])),
+                "min_expectation": float(row["min_expectation"]),
+            }
+    return data
+
+
 
 def evaluate_strategy_with_errorbars(
     routing_strategy: RoutingStrategy,
@@ -1020,6 +1102,84 @@ def plot_two_axis_with_errorbars(
         fig.savefig(out_png, dpi=300)
         plt.show()
 
+def plot_two_axis_no_errorbars_expectation(
+    expectation_values: List[float],
+    results: Dict[str, Dict[float, Dict[str, float]]],
+    out_png: str,
+    title: str,
+) -> None:
+    with plt.style.context(["science", "nature"]):
+        plt.rcParams.update({
+            "font.size": 11,
+            "axes.labelsize": 11,
+            "axes.titlesize": 11,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "legend.fontsize": 11,
+        })
+
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+        ax2 = ax1.twinx()
+
+        for strat_name, per_E in results.items():
+            x = np.array(expectation_values, dtype=float)
+
+            t_mean = np.array(
+                [per_E.get(E, {}).get("timesteps_mean", np.nan) for E in expectation_values],
+                dtype=float,
+            )
+            m_mean = np.array(
+                [per_E.get(E, {}).get("movements_mean", np.nan) for E in expectation_values],
+                dtype=float,
+            )
+
+            # Timesteps (linke Achse)
+            ax1.plot(
+                x,
+                t_mean,
+                marker="o",
+                linestyle="-",
+                color="#ed9015" if "Rotation" in strat_name else "tab:blue",
+                label=f"{strat_name} (Timesteps)",
+            )
+
+            # Movements (rechte Achse)
+            ax2.plot(
+                x,
+                m_mean,
+                marker="s",
+                linestyle="--",
+                color="#ed9015" if "Rotation" in strat_name else "tab:blue",
+                label=f"{strat_name} (Movements)",
+            )
+
+        ax1.set_xlabel("Expectation Value E of Working Edges", labelpad=10)
+        ax1.set_ylabel("Mean Timesteps", labelpad=12)
+        ax2.set_ylabel("Mean Movements", labelpad=12)
+
+        ax1.set_title(title)
+        ax1.set_xticks(expectation_values)
+        ax1.grid(True, which="both", linestyle="--", alpha=0.4)
+
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        legend = ax1.legend(
+            h1 + h2,
+            l1 + l2,
+            loc="upper right",
+            borderaxespad=1.5,
+            borderpad=0.8,
+            frameon=True,
+        )
+        legend.get_frame().set_facecolor("white")
+        legend.get_frame().set_edgecolor("black")
+        legend.get_frame().set_alpha(1.0)
+
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=300)
+        plt.ylim(65, 110)
+        plt.show()
+
 
 def plot_two_axis_no_errorbars(
     n_qubits_list: List[int],
@@ -1102,78 +1262,82 @@ def plot_two_axis_no_errorbars(
 
 def main():
     # -----------------------
-    # Experiment-Parameter
+    # Experiment: Expectation E Sweep
     # -----------------------
     width, height = 3, 3
+    n_qubits = 6
     rounds = 5
-    p_success = 0.99
-    p_repair = 0.25
-    n_samples = 50
+    n_samples = 100
 
-    # Qubit-Spanne: du kannst das hier anpassen
-    n_qubits_list = list(range(2, 25))  # 2..24
+    min_expectation = 0.4
+    step = 0.05
 
-    csv_path = "results_strategy_3x3.csv"
-    plot_path = "strategy_3x3_timesteps_movements.pdf"
+    # E von 0.40..1.00 in 0.05 Schritten
+    expectation_values = [round(min_expectation + i * step, 2) for i in range(int(round((1.0 - min_expectation) / step)) + 1)]
 
-    # Wenn CSV schon existiert, laden wir sie (damit du plotten kannst ohne neu zu simulieren).
-    existing = load_results_csv(csv_path)
+    csv_path = "results_expectation_3x3.csv"
+    plot_path = "expectation_3x3_timesteps_movements.pdf"
+
+    existing = load_results_csv_expectation(csv_path)
 
     strategies = {
-        "Default": DefaultRoutingPlanner(),
-        "Rotation": RotationRoutingPlanner(),
+        "Path Algorithm with Waiting": {
+            "router": DefaultRoutingPlanner(),
+            "min_expectation": 0.8,
+        },
+        "Rotation Algorithm with Waiting": {
+            "router": RotationRoutingPlanner(),
+            "min_expectation": 0.4,
+        },
     }
 
     # -----------------------
     # Falls Daten fehlen: evaluieren + in CSV schreiben
     # -----------------------
-    for strat_name, strat in strategies.items():
-        missing_any = (
-            strat_name not in existing
-            or any(nq not in existing[strat_name] for nq in n_qubits_list)
-        )
-        if missing_any:
-            # optional: wenn schon alte Daten drin sind, nicht doppelt schreiben:
-            # => wir schreiben nur die NQs, die fehlen
-            already = existing.get(strat_name, {})
-            todo_nqs = [nq for nq in n_qubits_list if nq not in already]
-            if not todo_nqs:
-                continue
+    for strat_name, cfg in strategies.items():
+        strat = cfg["router"]
+        min_E = cfg["min_expectation"]
 
-            t_mean, t_std, m_mean, m_std, n_success = evaluate_strategy_with_errorbars(
+        already = existing.get(strat_name, {})
+        todo_E = [E for E in expectation_values if E not in already]
+
+        if todo_E:
+            t_mean, m_mean = evaluate_strategy_vs_edge_expectation(
                 routing_strategy=strat,
-                n_qubits_list=todo_nqs,
+                expectation_values=todo_E,
+                n_qubits=n_qubits,
                 n_samples=n_samples,
                 width=width,
                 height=height,
                 rounds=rounds,
-                p_success=p_success,
-                p_repair=p_repair,
+                min_expectation=min_E,   # ← STRATEGIE-SPEZIFISCH
             )
 
-            save_results_csv(
+            save_results_csv_expectation(
                 path=csv_path,
-                n_qubits_list=todo_nqs,
+                expectations=todo_E,
                 strategy_name=strat_name,
                 timesteps_mean=t_mean,
-                timesteps_std=t_std,
                 movements_mean=m_mean,
-                movements_std=m_std,
-                n_success=n_success,
+                n_qubits=n_qubits,
                 n_samples=n_samples,
+                width=width,
+                height=height,
+                rounds=rounds,
+                min_expectation=min_E,   # ← STRATEGIE-SPEZIFISCH
             )
 
-            # reload to include newly written rows
-            existing = load_results_csv(csv_path)
+            existing = load_results_csv_expectation(csv_path)
+
 
     # -----------------------
     # Plot aus CSV (immer)
     # -----------------------
-    plot_two_axis_no_errorbars(
-        n_qubits_list=n_qubits_list,
+    plot_two_axis_no_errorbars_expectation(
+        expectation_values=expectation_values,
         results={
-            "Path Algorithm with Waiting": existing.get("Default", {}),
-            "Rotation Algorithm with Waiting": existing.get("Rotation", {}),
+            "Path Algorithm with Waiting": existing.get("Path Algorithm with Waiting", {}),
+            "Rotation Algorithm with Waiting": existing.get("Rotation Algorithm with Waiting", {}),
         },
         out_png=plot_path,
         title="",
