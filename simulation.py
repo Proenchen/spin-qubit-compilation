@@ -37,7 +37,7 @@ class RoutingSimulator:
         self.routing_strategy = routing_strategy
         self.config = config
 
-    def run(self) -> None:
+    def run(self):
         # 1) Netzwerk + Qubits + Paare
         G, qubits, pairs = self.placement_strategy.build_network_and_place(
             width=self.config.width,
@@ -56,4 +56,4 @@ class RoutingSimulator:
             self.config.p_repair,
         )
 
-        animate_mapf(G, timelines, edge_timebands=edge_timebands, smooth=True)
+        return timelines, edge_timebands

@@ -7,8 +7,8 @@ import networkx as nx
 from routing.common import AStar, Coord, MAX_TIME, Reservations, TimedNode, Qubit
 from routing.routing_strategy import RoutingStrategy
 
-MAX_REPLANS = 8
-MAX_GLOBAL_ITERS = 8
+MAX_REPLANS = 50
+MAX_GLOBAL_ITERS = 50
 
 
 class DefaultRoutingPlanner(RoutingStrategy):
@@ -110,7 +110,7 @@ class DefaultRoutingPlanner(RoutingStrategy):
             if exhausted_pairs_step1:
                 layers[idx+1:idx+1] = [exhausted_pairs_step1]
 
-            DefaultRoutingPlanner._debug_print_meetings(idx, fixed_meetings, header="-- Nach _plan_layer_only --")
+            #DefaultRoutingPlanner._debug_print_meetings(idx, fixed_meetings, header="-- Nach _plan_layer_only --")
 
             # Paare aus Schritt 1 nicht planbar → Spillover (wir haben alle Kandidaten versucht)
             if unplaceable_pairs_step1:

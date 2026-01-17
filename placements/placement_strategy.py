@@ -24,7 +24,36 @@ class PlacementStrategy(ABC):
         - IDs: 0 .. n_qubits-1
         - pro Runde: disjunkte Paare, d.h. jedes Qubit max. einmal
         - über Runden hinweg: Wiederholungen möglich
+        - NEU: Anzahl der Paare pro Runde ist zufällig (inkl. evtl. 0)
         """
+        """ rng = random.Random(seed)
+        pair_ids: List[Tuple[int, int]] = []
+
+        for _ in range(rounds):
+            ids = list(range(n_qubits))
+            rng.shuffle(ids)
+
+            possible_pairs = len(ids) // 2
+            if possible_pairs == 0:
+                continue
+
+            max_pairs = (
+                possible_pairs
+                if max_pairs_per_round is None
+                else min(max_pairs_per_round, possible_pairs)
+            )
+
+            if max_pairs <= 0:
+                continue
+
+            use_pairs = rng.randint(1, max_pairs)
+
+            for k in range(use_pairs):
+                a_id = ids[2 * k]
+                b_id = ids[2 * k + 1]
+                pair_ids.append((a_id, b_id))
+
+        return pair_ids """
         rng = random.Random(seed)
         pair_ids: List[Tuple[int, int]] = []
 

@@ -1,67 +1,27 @@
-"""
-Evaluation script for comparing DefaultRoutingPlanner vs RerouteRoutingPlanner
-across grid sizes 1x1 .. 10x10 and qubit counts 2..#SN with rounds=5.
-
-Metrics collected per run:
-- movements: total number of qubit coordinate changes across all timelines
-- timesteps: the maximum timestamp found in timelines
-- runtime_s: wall-clock seconds for the routing call
-- exception: 1 if the planner raised an exception (e.g., no valid routing), else 0
-
-Outputs:
-- evaluation_results.csv (full raw records)
-- plots: movements.png, timesteps.png, runtime.png, exception_rate.png
-"""
-
-import sys
-import time
-import math
+import os
+import csv
 import random
-import argparse
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Set, Optional
-from routing.routing_with_reroute import RerouteRoutingPlanner 
-from routing.default_routing import DefaultRoutingPlanner
-from routing.common import Qubit, TimedNode
-from utils.network import NetworkBuilder
+import time
+from statistics import mean, stdev
+from typing import Dict, List, Tuple
 
-import networkx as nx
-import pandas as pd
 import matplotlib.pyplot as plt
+import networkx as nx
 import numpy as np
+import scienceplots 
 
-
-
-def pick_qubits_and_pairs(
-    G: nx.Graph,
-    n_qubits: int,
-    rounds: int,
-    seed: int
-) -> Tuple[List[Qubit], List[Tuple[Qubit, Qubit]]]:
-    """
-    Self-contained generator for qubits & pairs if you don't want to rely on an external NetworkBuilder.
-    - Places qubits on distinct SN nodes uniformly at random.
-    - For each round, randomly pairs qubits (last one dropped if odd).
-    - Returns a *flat list* of pairs (concatenated across rounds), matching the expectation in your planners.
-    """
-    rng = random.Random(seed)
-    sn_nodes = [n for n in G.nodes if G.nodes[n].get("type") == "SN"]
-    if n_qubits > len(sn_nodes):
-        raise ValueError(f"Requested {n_qubits} qubits but only {len(sn_nodes)} SN nodes exist.")
-    chosen = rng.sample(sn_nodes, n_qubits)
-    qubits = [Qubit(id=i, pos=chosen[i]) for i in range(n_qubits)]
-
-    pairs: List[Tuple[Qubit, Qubit]] = []
-    ids = list(range(n_qubits))
-    for _ in range(rounds):
-        rng.shuffle(ids)
-        # Pair consecutive ids
-        for i in range(0, len(ids) - 1, 2):
-            qa = qubits[ids[i]]
-            qb = qubits[ids[i + 1]]
-            pairs.append((qa, qb))
-    return qubits, pairs
-
+from routing.common import TimedNode  
+from routing.routing_strategy import RoutingStrategy
+from routing.default_routing import DefaultRoutingPlanner
+from routing.routing_with_reroute import RerouteRoutingPlanner
+from routing.rotation_routing import RotationRoutingPlanner
+from routing.rotation_bypass_routing import HybridRotationRoutingPlanner
+from placements.placement_strategy import PlacementStrategy
+from placements.random_strategy import RandomPlacementStrategy
+from placements.reverse_traversal_strategy import ReverseTraversalPlacementStrategy
+from placements.interaction_placement_strategy import InteractionPlacementStrategy
+from simulation import SimulationConfig, RoutingSimulator
+from utils.network import NetworkBuilder  
 
 def count_movements(timelines: Dict[int, List[TimedNode]]) -> int:
     """
@@ -69,8 +29,7 @@ def count_movements(timelines: Dict[int, List[TimedNode]]) -> int:
     Assumes timelines are sequences of (coord, t) with non-decreasing t and possibly repeated coords.
     """
     moves = 0
-    for qid, path in timelines.items():
-        # Group by consecutive time steps and compare coordinates
+    for _qid, path in timelines.items():
         for (c1, _t1), (c2, _t2) in zip(path[:-1], path[1:]):
             if c1 != c2:
                 moves += 1
@@ -85,399 +44,1144 @@ def total_timesteps(timelines: Dict[int, List[TimedNode]]) -> int:
     return max_t
 
 
-def run_one(
-    PlannerClass,
-    G: nx.Graph,
-    qubits: List[Qubit],
-    pairs: List[Tuple[Qubit, Qubit]],
-    p_success: float,
-    p_repair: float,
-):
-    start = time.perf_counter()
-    timelines, _ = PlannerClass.route(G, qubits, pairs, p_success=p_success, p_repair=p_repair)
-    end = time.perf_counter()
-    return {
-        "movements": count_movements(timelines),
-        "timesteps": total_timesteps(timelines),
-        "runtime_s": end - start,
-        "exception": 0,
-    }
+# --------- SN-Knoten zählen im 4x4-Tile-Gitter ---------
 
-
-def evaluate(
-    max_size: int,
-    rounds: int,
-    base_seed: int,
-    n_seed_samples: int,
-    p_success: float,
-    p_repair: float,
-    limit_qubits: Optional[int],
-) -> pd.DataFrame:
+def get_max_sn_nodes(width: int, height: int) -> int:
     """
-    Iterate grid sizes and qubit counts, run both planners, and collect metrics.
-    For each (grid, n_qubits) combination, evaluate n_seed_samples random seeds.
-    Prints progress to the console.
+    Baue das Netzwerk mit NetworkBuilder und zähle alle Knoten,
+    deren Attribut 'type' == 'SN' ist.
     """
-    records = []
-    grid_list = [(n, n) for n in range(2, max_size + 1)]
+    G: nx.Graph = NetworkBuilder.build_network(width, height)
+    n_sn = sum(1 for _, data in G.nodes(data=True) if data.get("type") == "SN")
+    return n_sn
 
-    # Rough total count for progress tracking
-    total_tasks = 0
-    for (w, h) in grid_list:
-        G_tmp = NetworkBuilder.build_network(w, h)
-        sn_nodes_tmp = [n for n in G_tmp.nodes if G_tmp.nodes[n].get("type") == "SN"]
-        max_qubits_tmp = len(sn_nodes_tmp) // 2
-        if limit_qubits is not None:
-            max_qubits_tmp = min(max_qubits_tmp, limit_qubits)
-        total_tasks += (max_qubits_tmp - 1) * n_seed_samples * 2  # both planners
 
-    task_counter = 0
-    print(f"Starting evaluation across {len(grid_list)} grids, total ~{total_tasks} planner runs\n")
+# --------- Evaluation für eine Routing-Strategie ---------
 
-    for (w, h) in grid_list:
-        print(f"\n=== Evaluating grid {w}x{h} ===")
-        G = NetworkBuilder.build_network(w, h)
-        sn_nodes = [n for n in G.nodes if G.nodes[n].get("type") == "SN"]
-        max_qubits = len(sn_nodes) // 2
-        if limit_qubits is not None:
-            max_qubits = min(max_qubits, limit_qubits)
+def evaluate_strategy(
+    routing_strategy: RoutingStrategy,
+    n_qubits_list: List[int],
+    n_samples: int = 20,
+    width: int = 4,
+    height: int = 4,
+    rounds: int = 5,
+    p_success: float = 0.99,
+    p_repair: float = 0.25,
+) -> Tuple[List[float], List[float]]:
 
-        for n_qubits in range(2, max_qubits + 1):
-            for seed_offset in range(n_seed_samples):
-                seed = base_seed + seed_offset
+    placement: PlacementStrategy = RandomPlacementStrategy()
+
+    avg_timesteps: List[float] = []
+    avg_movements: List[float] = []
+
+    # NEU: sobald für eine Qubit-Anzahl alle Samples fehlschlagen (→ NaN),
+    # wird die Strategie für alle größeren Qubit-Anzahlen nicht mehr evaluiert.
+    strategy_dead = False
+
+    print(f"\n=== Starte Evaluation für {routing_strategy.__class__.__name__} ===")
+
+    for idx_q, n_qubits in enumerate(n_qubits_list, start=1):
+        # Wenn die Strategie bereits "tot" ist: direkt NaN anhängen und weitermachen
+        if strategy_dead:
+            print(
+                f"\nQubits: {n_qubits} ({idx_q}/{len(n_qubits_list)}) "
+                f"→ skipped (already dead), setze NaN."
+            )
+            avg_timesteps.append(float("nan"))
+            avg_movements.append(float("nan"))
+            continue
+
+        timesteps_samples: List[int] = []
+        movements_samples: List[int] = []
+
+        print(f"\nQubits: {n_qubits} ({idx_q}/{len(n_qubits_list)})")
+
+        for sample_idx in range(n_samples):
+            print(f"  Sample {sample_idx+1}/{n_samples} ...", end="", flush=True)
+
+            base_seed = 1000 * n_qubits + sample_idx
+            random.seed(base_seed)
+
+            config = SimulationConfig(
+                width=width,
+                height=height,
+                n_qubits=n_qubits,
+                rounds=rounds,
+                p_success=p_success,
+                p_repair=p_repair,
+                seed=base_seed,
+            )
+
+            simulator = RoutingSimulator(
+                placement_strategy=placement,
+                routing_strategy=routing_strategy,
+                config=config,
+            )
+
+            try:
+                timelines, _ = simulator.run()
+            except Exception as e:
+                # Routing fehlgeschlagen – Sample nicht mitzählen
+                print(f" FAILED ({e})", flush=True)
+                continue
+
+            timesteps_samples.append(total_timesteps(timelines))
+            movements_samples.append(count_movements(timelines))
+
+            print(" done", flush=True)
+
+        if timesteps_samples:
+            avg_timesteps.append(mean(timesteps_samples))
+            avg_movements.append(mean(movements_samples))
+        else:
+            # Keine erfolgreichen Samples für diese Qubit-Anzahl
+            print(
+                f"  WARNUNG: Keine erfolgreichen Samples für n_qubits={n_qubits}, "
+                f"setze Wert auf NaN und markiere Strategie als DEAD."
+            )
+            avg_timesteps.append(float("nan"))
+            avg_movements.append(float("nan"))
+            strategy_dead = True  # NEU: ab jetzt werden alle weiteren n_qubits geskippt
+
+    return avg_timesteps, avg_movements
+
+
+def evaluate_strategy_vs_edge_expectation(
+    routing_strategy: RoutingStrategy,
+    expectation_values: List[float],
+    n_qubits: int = 8,
+    n_samples: int = 100,
+    width: int = 3,
+    height: int = 3,
+    rounds: int = 5,
+    min_expectation: float = 0.0,   # NEU
+) -> Tuple[List[float], List[float]]:
+
+    placement: PlacementStrategy = RandomPlacementStrategy()
+
+    avg_timesteps: List[float] = []
+    avg_movements: List[float] = []
+
+    print(f"\n=== Starte Evaluation für {routing_strategy.__class__.__name__} "
+          f"über Erwartungswert der funktionierenden Kanten ===")
+
+    for idx_e, expectation in enumerate(expectation_values, start=1):
+
+        # ----------------------------------------
+        # NEU: Erwartungswert < Schwelle → NaN
+        # ----------------------------------------
+        if expectation < min_expectation:
+            print(f"\nE={expectation:.2f} < {min_expectation} → skip → NaN")
+
+            avg_timesteps.append(float("nan"))
+            avg_movements.append(float("nan"))
+            continue
+        # ----------------------------------------
+
+        timesteps_samples: List[int] = []
+        movements_samples: List[int] = []
+
+        # aus Erwartungswert E die Parameter ableiten
+        p_success = expectation
+        p_repair = expectation
+
+        print(f"\nE={expectation:.2f} → p_success=p_repair={expectation:.2f}")
+
+        for sample_idx in range(n_samples):
+            print(f"  Sample {sample_idx+1}/{n_samples} ...", end="", flush=True)
+
+            base_seed = 10_000 * idx_e + sample_idx
+            random.seed(base_seed)
+
+            config = SimulationConfig(
+                width=width,
+                height=height,
+                n_qubits=n_qubits,
+                rounds=rounds,
+                p_success=p_success,
+                p_repair=p_repair,
+                seed=base_seed,
+            )
+
+            simulator = RoutingSimulator(
+                placement_strategy=placement,
+                routing_strategy=routing_strategy,
+                config=config,
+            )
+
+            try:
+                timelines, _ = simulator.run()
+            except Exception:
+                print(" FAILED", flush=True)
+                continue
+
+            timesteps_samples.append(total_timesteps(timelines))
+            movements_samples.append(count_movements(timelines))
+
+            print(" done", flush=True)
+
+        if timesteps_samples:
+            avg_timesteps.append(mean(timesteps_samples))
+            avg_movements.append(mean(movements_samples))
+        else:
+            avg_timesteps.append(float("nan"))
+            avg_movements.append(float("nan"))
+
+    return avg_timesteps, avg_movements
+
+
+def evaluate_strategies_over_grids(
+    routing_strategies: Dict[str, RoutingStrategy],
+    grid_sizes: List[Tuple[int, int]],
+    n_samples: int = 50,
+    rounds: int = 5,
+    p_success: float = 0.9,
+    p_repair: float = 0.25,
+) -> Tuple[Dict[str, List[float]], Dict[str, List[float]], List[int]]:
+    """
+    Evaluieren von mehreren Routing-Strategien über verschiedene Grid-Sizes.
+    Qubit-Anzahl pro Grid: 0.25 * (#SN-Nodes), abgerundet.
+
+    Rückgabe:
+      - avg_timesteps[strategiename][i] = Durchschnitts-Timesteps für grid_sizes[i]
+      - avg_movements[strategiename][i] = Durchschnitts-Movements für grid_sizes[i]
+      - qubits_per_grid[i] = tatsächlich verwendete Qubit-Anzahl für grid_sizes[i]
+    """
+    placement: PlacementStrategy = RandomPlacementStrategy()
+
+    avg_timesteps: Dict[str, List[float]] = {name: [] for name in routing_strategies}
+    avg_movements: Dict[str, List[float]] = {name: [] for name in routing_strategies}
+    qubits_per_grid: List[int] = []
+
+    for (width, height) in grid_sizes:
+        # Anzahl SN-Nodes bestimmen
+        n_sn = get_max_sn_nodes(width, height)
+        if (width, height) == (5, 5):
+            n_qubits = 12
+        else:
+            n_qubits = max(2, int(0.25 * n_sn))
+        qubits_per_grid.append(n_qubits)
+
+        print(f"\n=== Grid {width}x{height}, SN={n_sn}, Qubits={n_qubits} ===")
+
+        for strat_name, routing_strategy in routing_strategies.items():
+            print(f"\n--- Strategie: {strat_name} ---")
+
+            timesteps_samples: List[int] = []
+            movements_samples: List[int] = []
+
+            for sample_idx in range(n_samples):
+                print(f"  Sample {sample_idx+1}/{n_samples} ...", end="", flush=True)
+
+                base_seed = 100_000 * (width * 10 + height) + sample_idx
+                random.seed(base_seed)
+
+                config = SimulationConfig(
+                    width=width,
+                    height=height,
+                    n_qubits=n_qubits,
+                    rounds=rounds,
+                    p_success=p_success,
+                    p_repair=p_repair,
+                    seed=base_seed,
+                )
+
+                simulator = RoutingSimulator(
+                    placement_strategy=placement,
+                    routing_strategy=routing_strategy,
+                    config=config,
+                )
 
                 try:
-                    qubits, pairs = pick_qubits_and_pairs(G, n_qubits=n_qubits, rounds=rounds, seed=seed)
+                    timelines, _ = simulator.run()
                 except Exception as e:
-                    print(f"[WARN] Skipping seed {seed} for {w}x{h}, n_qubits={n_qubits}: {e}")
+                    print(f" FAILED ({e})", flush=True)
                     continue
 
-                for algo_name, PlannerClass in [
-                    ("Default", DefaultRoutingPlanner),
-                    ("Reroute", RerouteRoutingPlanner),
-                ]:
-                    task_counter += 1
-                    print(
-                        f"[{task_counter:5d}/{total_tasks}] "
-                        f"Grid={w}x{h}, n_qubits={n_qubits}, seed={seed}, algo={algo_name}...",
-                        end=""
-                    )
-                    sys.stdout.flush()
+                timesteps_samples.append(total_timesteps(timelines))
+                movements_samples.append(count_movements(timelines))
 
-                    try:
-                        m = run_one(PlannerClass, G, qubits, pairs, p_success, p_repair)
-                        status = "OK"
-                    except Exception as e:
-                        m = {"movements": np.nan, "timesteps": np.nan, "runtime_s": np.nan, "exception": 1}
-                        status = f"FAIL ({type(e).__name__})"
+                print(" done", flush=True)
 
-                    records.append({
-                        "algo": algo_name,
-                        "width": w,
-                        "height": h,
-                        "n_qubits": n_qubits,
-                        "seed": seed,
-                        **m
-                    })
+            if timesteps_samples:
+                avg_timesteps[strat_name].append(mean(timesteps_samples))
+                avg_movements[strat_name].append(mean(movements_samples))
+            else:
+                avg_timesteps[strat_name].append(float("nan"))
+                avg_movements[strat_name].append(float("nan"))
 
-                    print(f" {status}, runtime={m.get('runtime_s', np.nan):.3f}s")
-
-    print("\nAll evaluations completed.\n")
-    return pd.DataFrame.from_records(records)
+    return avg_timesteps, avg_movements, qubits_per_grid
 
 
-
-def make_plots(df: pd.DataFrame, out_prefix: str = "eval"):
+def evaluate_placements_for_routing(
+    routing_strategy: RoutingStrategy,
+    placement_strategies: Dict[str, PlacementStrategy],
+    width: int = 3,
+    height: int = 3,
+    n_samples: int = 100,
+    rounds: int = 5,
+    p_success: float = 0.998,
+    p_repair: float = 0.25,
+    n_qubits: int = 8
+) -> Tuple[Dict[str, float], Dict[str, float], int]:
     """
-    Erstellt für JEDE Netzwerkgröße (width x height) getrennte Plots:
-    - Mean movements vs n_qubits per algo
-    - Mean timesteps vs n_qubits per algo
-    - Mean runtime vs n_qubits per algo
-    - Exception rate vs n_qubits per algo
+    Evaluiert mehrere Placement-Strategien für einen gegebenen Router
+    auf einem festen Grid (default 3x3).
 
-    Dateien werden als:
-      {out_prefix}_{w}x{h}_movements.png
-      {out_prefix}_{w}x{h}_timesteps.png
-      {out_prefix}_{w}x{h}_runtime.png
-      {out_prefix}_{w}x{h}_exception_rate.png
-    gespeichert.
+    Rückgabe:
+      - avg_timesteps[name]  = Durchschnitt Timesteps für Placement 'name'
+      - avg_movements[name] = Durchschnitt Movements für Placement 'name'
+      - n_qubits            = verwendete Qubit-Anzahl (für Info)
     """
 
-    # Alle vorhandenen Grid-Größen (sortiert)
-    grids = (
-        df[["width", "height"]]
-        .drop_duplicates()
-        .sort_values(["width", "height"])
-        .itertuples(index=False, name=None)
+    # Qubit-Anzahl wie in deinen Grid-Tests: 0.25 * #SN-Nodes
+    n_sn = get_max_sn_nodes(width, height)
+
+    print(f"\n=== Router: {routing_strategy.__class__.__name__} ===")
+    print(f"Grid: {width}x{height}, SN={n_sn}, Qubits={n_qubits}")
+    print(f"Samples={n_samples}, rounds={rounds}, p_success={p_success}, p_repair={p_repair}")
+
+    avg_timesteps: Dict[str, float] = {}
+    avg_movements: Dict[str, float] = {}
+
+    for pname, placement in placement_strategies.items():
+        print(f"\n--- Placement-Strategie: {pname} ---")
+
+        timesteps_samples: List[int] = []
+        movements_samples: List[int] = []
+
+        for sample_idx in range(n_samples):
+            print(f"  Sample {sample_idx+1}/{n_samples} ...", end="", flush=True)
+
+            base_seed = 1_000_000 * hash(pname) % (2**31 - 1) + sample_idx
+            random.seed(base_seed)
+
+            config = SimulationConfig(
+                width=width,
+                height=height,
+                n_qubits=n_qubits,
+                rounds=rounds,
+                p_success=p_success,
+                p_repair=p_repair,
+                seed=base_seed,
+            )
+
+            simulator = RoutingSimulator(
+                placement_strategy=placement,
+                routing_strategy=routing_strategy,
+                config=config,
+            )
+
+            try:
+                timelines, _ = simulator.run()
+            except Exception as e:
+                print(f" FAILED ({e})", flush=True)
+                continue
+
+            timesteps_samples.append(total_timesteps(timelines))
+            movements_samples.append(count_movements(timelines))
+
+            print(" done", flush=True)
+
+        if timesteps_samples:
+            avg_timesteps[pname] = mean(timesteps_samples)
+            avg_movements[pname] = mean(movements_samples)
+        else:
+            avg_timesteps[pname] = float("nan")
+            avg_movements[pname] = float("nan")
+
+    return avg_timesteps, avg_movements, n_qubits
+
+
+def evaluate_exception_rates_for_strategies_3x3(
+    n_qubits_min: int = 2,
+    n_qubits_max: int = 24,
+    n_samples: int = 100,
+    width: int = 3,
+    height: int = 3,
+    p_success: float = 0.998,
+    p_repair: float = 0.25,
+) -> Dict[str, List[float]]:
+    """
+    Evaluiert für Qubit-Anzahlen von n_qubits_min bis n_qubits_max (inkl.)
+    die Exception-Rate für alle vier Routing-Strategien auf einem 3x3-Grid
+    mit RandomPlacement.
+
+    NEU:
+        Wenn eine Strategie bei einem n_qubits eine Exception-Rate von 1 erreicht,
+        wird sie für alle höheren n_qubits nicht mehr ausgeführt und die
+        Exception-Rate automatisch auf 1 gesetzt.
+    """
+
+    routing_strategies: Dict[str, RoutingStrategy] = {
+        "Default": DefaultRoutingPlanner(),
+        "Reroute": RerouteRoutingPlanner(),
+        "Rotation": RotationRoutingPlanner(),
+        "HybridRotation": HybridRotationRoutingPlanner(),
+    }
+
+    placement: PlacementStrategy = RandomPlacementStrategy()
+
+    n_qubits_list = list(range(n_qubits_min, n_qubits_max + 1))
+    exception_rates: Dict[str, List[float]] = {name: [] for name in routing_strategies}
+
+    # NEW: Track whether a strategy is permanently failed
+    strategy_dead: Dict[str, bool] = {name: False for name in routing_strategies}
+
+    print("\n=== Exception-Rate Evaluation (3x3 Grid, RandomPlacement) ===")
+    print(f"Qubits {n_qubits_min}..{n_qubits_max}, Samples={n_samples}, "
+          f"p_success={p_success}, p_repair={p_repair}")
+
+    for n_qubits in n_qubits_list:
+        print(f"\n--- n_qubits = {n_qubits} ---")
+
+        for strat_name, routing_strategy in routing_strategies.items():
+            if strategy_dead[strat_name]:
+                exception_rates[strat_name].append(1.0)
+                print(f"  Strategie: {strat_name} → skipped (already dead), rate=1")
+                continue
+
+            print(f"  Strategie: {strat_name}")
+
+            fail_count = 0
+
+            for sample_idx in range(n_samples):
+                print(f"    Sample {sample_idx+1}/{n_samples} ...", end="", flush=True)
+
+                base_seed = (
+                    (hash(strat_name) & 0x7FFFFFFF) * 10_000
+                    + n_qubits * 100
+                    + sample_idx
+                )
+                random.seed(base_seed)
+
+                config = SimulationConfig(
+                    width=width,
+                    height=height,
+                    n_qubits=n_qubits,
+                    rounds=5,
+                    p_success=p_success,
+                    p_repair=p_repair,
+                    seed=base_seed,
+                )
+
+                simulator = RoutingSimulator(
+                    placement_strategy=placement,
+                    routing_strategy=routing_strategy,
+                    config=config,
+                )
+
+                try:
+                    simulator.run()
+                    print(" ok", flush=True)
+                except Exception as e:
+                    fail_count += 1
+                    print(f" FAILED ({e})", flush=True)
+
+            rate = fail_count / n_samples
+            exception_rates[strat_name].append(rate)
+            print(f"  → Exception-Rate {strat_name} @ n_qubits={n_qubits}: {rate:.3f}")
+
+            # ----------------------------------------------------------
+            # NEU: Marke Strategie als "tot", wenn Rate == 1
+            # ----------------------------------------------------------
+            if rate >= 1.0:
+                strategy_dead[strat_name] = True
+                print(f"  → {strat_name} marked as DEAD (will skip future runs)")
+
+    # Plot erstellen
+    plt.figure(figsize=(10, 6))
+    for strat_name, rates in exception_rates.items():
+        plt.plot(n_qubits_list, rates, marker="o", label=strat_name)
+
+    plt.xlabel("Anzahl Qubits")
+    plt.ylabel("Exception-Rate")
+    plt.title(
+        "Exception-Rate vs. Qubit-Anzahl\n"
+        "3x3-Grid, RandomPlacement, p_success=0.998, p_repair=0.25, 100 Samples"
     )
+    plt.xticks(n_qubits_list, rotation=45)
+    plt.ylim(-0.05, 1.05)
+    plt.grid(True, which="both", linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("D:\\Uni\\failrate_qubits.png")
+    plt.show()
 
-    for (w, h) in grids:
-        df_grid = df[(df["width"] == w) & (df["height"] == h)].copy()
-        if df_grid.empty:
+    return exception_rates
+
+
+def evaluate_exception_rates_vs_edge_expectation_3x3(
+    expectation_values: List[float] = None,
+    n_qubits: int = 6,
+    n_samples: int = 20,
+    width: int = 3,
+    height: int = 3,
+    rounds: int = 5,
+) -> Dict[str, List[float]]:
+    """
+    Evaluiert für eine Liste von Erwartungswerten E (funktionierende Kanten)
+    die Exception-Rate für alle vier Routing-Strategien auf einem 3x3-Grid
+    mit RandomPlacement und fixer Qubit-Anzahl (default 6).
+
+    Für jeden Erwartungswert E gilt:
+        p_success = E
+        p_repair  = E
+
+    NEU:
+        Wenn eine Strategie bei einem Erwartungswert eine Exception-Rate von 1 erreicht,
+        wird sie für alle nachfolgenden (kleineren) Erwartungswerte nicht mehr ausgeführt
+        und die Exception-Rate automatisch auf 0 gesetzt.
+
+    Rückgabe:
+        exception_rates[strategiename][i] = Exception-Rate für expectation_values[i]
+        (in der Reihenfolge von expectation_values, wie übergeben/erzeugt)
+    """
+
+    # Default: von 1.0 in 0.05-Schritten runter bis 0.0
+    if expectation_values is None:
+        expectation_values = [round(1.0 - 0.025 * i, 3) for i in range(41)]
+        # -> [1.0, 0.95, 0.90, ..., 0.0]
+
+    routing_strategies: Dict[str, RoutingStrategy] = {
+        "Default": DefaultRoutingPlanner(),
+        "Reroute": RerouteRoutingPlanner(),
+        "Rotation": RotationRoutingPlanner(),
+        "HybridRotation": HybridRotationRoutingPlanner(),
+    }
+
+    placement: PlacementStrategy = RandomPlacementStrategy()
+
+    exception_rates: Dict[str, List[float]] = {name: [] for name in routing_strategies}
+
+    # Track, ob eine Strategie "tot" ist (ab irgendeinem E Failrate = 1)
+    strategy_dead: Dict[str, bool] = {name: False for name in routing_strategies}
+
+    print("\n=== Exception-Rate vs. Erwartungswert E (3x3 Grid, RandomPlacement) ===")
+    print(f"Grid: {width}x{height}, n_qubits={n_qubits}, Samples={n_samples}, rounds={rounds}")
+    print("E-Werte (absteigend ausgewertet):", expectation_values)
+
+    for E in expectation_values:
+        print(f"\n--- Erwartungswert E = {E:.2f} ---")
+
+        p_success = E
+        p_repair = E
+
+        for strat_name, routing_strategy in routing_strategies.items():
+            if strategy_dead[strat_name]:
+                # Strategie wird nicht mehr ausgeführt, Rate = 0 für alle folgenden E
+                exception_rates[strat_name].append(1.0)
+                print(f"  Strategie: {strat_name} → skipped (already dead), rate=0")
+                continue
+
+            print(f"  Strategie: {strat_name}")
+
+            fail_count = 0
+
+            for sample_idx in range(n_samples):
+                print(f"    Sample {sample_idx+1}/{n_samples} ...", end="", flush=True)
+
+                # Seed abhängig von Strategie, E und Sample-Index
+                base_seed = 42
+                random.seed(base_seed)
+
+                config = SimulationConfig(
+                    width=width,
+                    height=height,
+                    n_qubits=n_qubits,
+                    rounds=rounds,
+                    p_success=p_success,
+                    p_repair=p_repair,
+                    seed=base_seed,
+                )
+
+                simulator = RoutingSimulator(
+                    placement_strategy=placement,
+                    routing_strategy=routing_strategy,
+                    config=config,
+                )
+
+                try:
+                    simulator.run()
+                    print(" ok", flush=True)
+                except Exception as e:
+                    fail_count += 1
+                    print(f" FAILED ({e})", flush=True)
+
+            rate = fail_count / n_samples
+            exception_rates[strat_name].append(rate)
+            print(f"  → Exception-Rate {strat_name} @ E={E:.2f}: {rate:.3f}")
+
+            # Wenn bei diesem E alle Samples failen → Strategie für kleinere E "tot"
+            if rate >= 1.0:
+                strategy_dead[strat_name] = True
+                print(f"  → {strat_name} marked as DEAD (will skip future E with rate=0)")
+
+    # Plot erstellen
+    # x-Achse: Erwartungswerte nach rechts größer → wir sortieren für den Plot aufsteigend
+    E_sorted = sorted(expectation_values)  # z.B. [0.0, 0.05, ..., 1.0]
+
+    plt.figure(figsize=(10, 6))
+    for strat_name, rates in exception_rates.items():
+        # Map von E -> Rate in der "Auswerte-Reihenfolge"
+        E_to_rate = {E: r for E, r in zip(expectation_values, rates)}
+        # Für den Plot in aufsteigender E-Reihenfolge sortieren
+        rates_sorted = [E_to_rate[E] for E in E_sorted]
+
+        plt.plot(E_sorted, rates_sorted, marker="o", label=strat_name)
+
+    plt.xlabel("Erwartungswert E funktionierender Kanten")
+    plt.ylabel("Exception-Rate")
+    plt.title(
+        "Exception-Rate vs. Erwartungswert E\n"
+        f"3x3-Grid, n_qubits={n_qubits}, RandomPlacement, 100 Samples pro E"
+    )
+    plt.xticks(E_sorted, rotation=45)
+    plt.ylim(-0.05, 1.05)
+    plt.grid(True, which="both", linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("D:\\Uni\\failrate_expectation.png")
+    plt.show()
+
+    return exception_rates
+
+
+def evaluate_runtimes_for_strategies_3x3(
+    n_qubits_min: int = 2,
+    n_qubits_max: int = 24,
+    n_samples: int = 100,
+    width: int = 3,
+    height: int = 3,
+    p_success: float = 0.998,
+    p_repair: float = 0.25,
+) -> Dict[str, List[float]]:
+    """
+    Wie evaluate_exception_rates_for_strategies_3x3, aber statt Exception-Rate
+    wird die durchschnittliche Laufzeit (in Sekunden) von simulator.run()
+    gemessen.
+
+    Logik:
+      - Für jede Strategie und jede Qubit-Anzahl werden n_samples Runs gemacht.
+      - Die Laufzeit jedes Runs (egal ob erfolgreich oder failed) geht in den
+        Mittelwert ein.
+      - Wenn es für eine (Strategie, n_qubits) keine erfolgreichen Runs gibt
+        (alle n_samples sind fehlgeschlagen), wird die Strategie als "DEAD"
+        markiert und für alle größeren n_qubits nicht mehr ausgeführt
+        (runtime=NaN).
+    """
+
+    routing_strategies: Dict[str, RoutingStrategy] = {
+        "Default": DefaultRoutingPlanner(),
+        "Reroute": RerouteRoutingPlanner(),
+        "Rotation": RotationRoutingPlanner(),
+        "HybridRotation": HybridRotationRoutingPlanner(),
+    }
+
+    placement: PlacementStrategy = RandomPlacementStrategy()
+
+    n_qubits_list = list(range(n_qubits_min, n_qubits_max + 1))
+    runtimes: Dict[str, List[float]] = {name: [] for name in routing_strategies}
+
+    # Track, ob eine Strategie dauerhaft "tot" ist
+    strategy_dead: Dict[str, bool] = {name: False for name in routing_strategies}
+
+    print("\n=== Runtime Evaluation (3x3 Grid, RandomPlacement) ===")
+    print(f"Qubits {n_qubits_min}..{n_qubits_max}, Samples={n_samples}, "
+          f"p_success={p_success}, p_repair={p_repair}")
+
+    for n_qubits in n_qubits_list:
+        print(f"\n--- n_qubits = {n_qubits} ---")
+
+        for strat_name, routing_strategy in routing_strategies.items():
+            # Wenn Strategie schon tot → direkt NaN eintragen
+            if strategy_dead[strat_name]:
+                runtimes[strat_name].append(float("nan"))
+                print(f"  Strategie: {strat_name} → skipped (already dead), runtime=NaN")
+                continue
+
+            print(f"  Strategie: {strat_name}")
+
+            sample_runtimes: List[float] = []
+            fail_count = 0
+
+            for sample_idx in range(n_samples):
+                print(f"    Sample {sample_idx+1}/{n_samples} ...", end="", flush=True)
+
+                base_seed = (
+                    (hash(strat_name) & 0x7FFFFFFF) * 10_000
+                    + n_qubits * 100
+                    + sample_idx
+                )
+                random.seed(base_seed)
+
+                config = SimulationConfig(
+                    width=width,
+                    height=height,
+                    n_qubits=n_qubits,
+                    rounds=5,
+                    p_success=p_success,
+                    p_repair=p_repair,
+                    seed=base_seed,
+                )
+
+                simulator = RoutingSimulator(
+                    placement_strategy=placement,
+                    routing_strategy=routing_strategy,
+                    config=config,
+                )
+
+                start_t = time.perf_counter()
+                try:
+                    simulator.run()
+                    print(" ok", flush=True)
+                except Exception as e:
+                    fail_count += 1
+                    print(f" FAILED ({e})", flush=True)
+                finally:
+                    duration = time.perf_counter() - start_t
+                    sample_runtimes.append(duration)
+
+            # sample_runtimes hat jetzt IMMER n_samples Einträge
+            avg_runtime = mean(sample_runtimes)
+            runtimes[strat_name].append(avg_runtime)
+            print(f"  → Avg runtime {strat_name} @ n_qubits={n_qubits}: {avg_runtime:.6f} s")
+
+            # Wenn alle Runs fehlgeschlagen sind → Strategie stirbt für größere n_qubits
+            if fail_count == n_samples:
+                print(
+                    f"  WARNUNG: Keine erfolgreichen Runs für {strat_name} "
+                    f"@ n_qubits={n_qubits}, markiere Strategie als DEAD."
+                )
+                strategy_dead[strat_name] = True
+
+    # Plot erstellen: Laufzeit vs. Qubit-Anzahl
+    plt.figure(figsize=(10, 6))
+    for strat_name, rt in runtimes.items():
+        plt.plot(n_qubits_list, rt, marker="o", label=strat_name)
+
+    plt.xlabel("Anzahl Qubits")
+    plt.ylabel("Durchschnittliche Laufzeit pro Run [s]")
+    plt.title(
+        "Laufzeit vs. Qubit-Anzahl\n"
+        "3x3-Grid, RandomPlacement, "
+        f"p_success={p_success}, p_repair={p_repair}, {n_samples} Samples"
+    )
+    plt.xticks(n_qubits_list, rotation=45)
+    plt.grid(True, which="both", linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("D:\\Uni\\runtime_qubits.png")
+    plt.show()
+
+    return runtimes
+
+
+def evaluate_strategy_with_errorbars(
+    routing_strategy: RoutingStrategy,
+    n_qubits_list: List[int],
+    n_samples: int = 20,
+    width: int = 3,
+    height: int = 3,
+    rounds: int = 5,
+    p_success: float = 0.99,
+    p_repair: float = 0.25,
+) -> Tuple[List[float], List[float], List[float], List[float], List[int]]:
+    """
+    Wie evaluate_strategy, aber zusätzlich Standardabweichungen (std) für Error Bars.
+    Rückgabe:
+      (timesteps_mean, timesteps_std, movements_mean, movements_std, n_successful_samples)
+    """
+    placement: PlacementStrategy = RandomPlacementStrategy()
+
+    t_mean: List[float] = []
+    t_std: List[float] = []
+    m_mean: List[float] = []
+    m_std: List[float] = []
+    n_success: List[int] = []
+
+    strategy_dead = False
+
+    print(f"\n=== Starte Evaluation für {routing_strategy.__class__.__name__} ===")
+
+    for idx_q, n_qubits in enumerate(n_qubits_list, start=1):
+        if strategy_dead:
+            print(
+                f"\nQubits: {n_qubits} ({idx_q}/{len(n_qubits_list)}) "
+                f"→ skipped (already dead), setze NaN."
+            )
+            t_mean.append(float("nan"))
+            t_std.append(float("nan"))
+            m_mean.append(float("nan"))
+            m_std.append(float("nan"))
+            n_success.append(0)
             continue
 
-        # Aggregation pro Algo und n_qubits für DIESES Grid
-        agg = df_grid.groupby(["algo", "n_qubits"], as_index=False).agg({
-            "movements": "mean",
-            "timesteps": "mean",
-            "runtime_s": "mean",
-            "exception": "mean",
+        timesteps_samples: List[int] = []
+        movements_samples: List[int] = []
+
+        print(f"\nQubits: {n_qubits} ({idx_q}/{len(n_qubits_list)})")
+
+        for sample_idx in range(n_samples):
+            print(f"  Sample {sample_idx+1}/{n_samples} ...", end="", flush=True)
+
+            base_seed = 1000 * n_qubits + sample_idx
+            random.seed(base_seed)
+
+            config = SimulationConfig(
+                width=width,
+                height=height,
+                n_qubits=n_qubits,
+                rounds=rounds,
+                p_success=p_success,
+                p_repair=p_repair,
+                seed=base_seed,
+            )
+
+            simulator = RoutingSimulator(
+                placement_strategy=placement,
+                routing_strategy=routing_strategy,
+                config=config,
+            )
+
+            try:
+                timelines, _ = simulator.run()
+            except Exception as e:
+                print(f" FAILED ({e})", flush=True)
+                continue
+
+            timesteps_samples.append(total_timesteps(timelines))
+            movements_samples.append(count_movements(timelines))
+            print(" done", flush=True)
+
+        n_success.append(len(timesteps_samples))
+
+        if timesteps_samples:
+            t_mean.append(mean(timesteps_samples))
+            m_mean.append(mean(movements_samples))
+
+            # std braucht mind. 2 Werte, sonst 0
+            t_std.append(stdev(timesteps_samples) if len(timesteps_samples) > 1 else 0.0)
+            m_std.append(stdev(movements_samples) if len(movements_samples) > 1 else 0.0)
+        else:
+            print(
+                f"  WARNUNG: Keine erfolgreichen Samples für n_qubits={n_qubits}, "
+                f"setze Wert auf NaN und markiere Strategie als DEAD."
+            )
+            t_mean.append(float("nan"))
+            t_std.append(float("nan"))
+            m_mean.append(float("nan"))
+            m_std.append(float("nan"))
+            strategy_dead = True
+
+    return t_mean, t_std, m_mean, m_std, n_success
+
+
+def save_results_csv(
+    path: str,
+    n_qubits_list: List[int],
+    strategy_name: str,
+    timesteps_mean: List[float],
+    timesteps_std: List[float],
+    movements_mean: List[float],
+    movements_std: List[float],
+    n_success: List[int],
+    n_samples: int,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(
+                [
+                    "strategy",
+                    "n_qubits",
+                    "timesteps_mean",
+                    "timesteps_std",
+                    "movements_mean",
+                    "movements_std",
+                    "n_success",
+                    "n_samples",
+                ]
+            )
+        for i, nq in enumerate(n_qubits_list):
+            writer.writerow(
+                [
+                    strategy_name,
+                    nq,
+                    timesteps_mean[i],
+                    timesteps_std[i],
+                    movements_mean[i],
+                    movements_std[i],
+                    n_success[i],
+                    n_samples,
+                ]
+            )
+
+
+def load_results_csv(path: str) -> Dict[str, Dict[int, Dict[str, float]]]:
+    """
+    Rückgabe:
+      data[strategy][n_qubits] = {
+        'timesteps_mean': ..., 'timesteps_std': ...,
+        'movements_mean': ..., 'movements_std': ...,
+        'n_success': ..., 'n_samples': ...
+      }
+    """
+    data: Dict[str, Dict[int, Dict[str, float]]] = {}
+    if not os.path.exists(path):
+        return data
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            strat = row["strategy"]
+            nq = int(row["n_qubits"])
+            data.setdefault(strat, {})
+            data[strat][nq] = {
+                "timesteps_mean": float(row["timesteps_mean"]),
+                "timesteps_std": float(row["timesteps_std"]),
+                "movements_mean": float(row["movements_mean"]),
+                "movements_std": float(row["movements_std"]),
+                "n_success": int(float(row["n_success"])),
+                "n_samples": int(float(row["n_samples"])),
+            }
+    return data
+
+
+def plot_two_axis_with_errorbars(
+    n_qubits_list: List[int],
+    results: Dict[str, Dict[int, Dict[str, float]]],
+    out_png: str,
+    title: str,
+) -> None:
+    # Twin axis plot: left=timesteps, right=movements
+    with plt.style.context(["science", "nature"]):
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+        ax2 = ax1.twinx()
+
+        for strat_name, per_nq in results.items():
+            x = np.array(n_qubits_list, dtype=float)
+
+            t_mean = np.array([per_nq.get(nq, {}).get("timesteps_mean", np.nan) for nq in n_qubits_list], dtype=float)
+            t_std = np.array([per_nq.get(nq, {}).get("timesteps_std", np.nan) for nq in n_qubits_list], dtype=float)
+
+            m_mean = np.array([per_nq.get(nq, {}).get("movements_mean", np.nan) for nq in n_qubits_list], dtype=float)
+            m_std = np.array([per_nq.get(nq, {}).get("movements_std", np.nan) for nq in n_qubits_list], dtype=float)
+
+            # Timesteps (left axis)
+            ax1.errorbar(
+                x,
+                t_mean,
+                yerr=t_std,
+                marker="o",
+                linestyle="-",
+                capsize=3,
+                label=f"{strat_name} (timesteps)",
+            )
+
+            # Movements (right axis) — gestrichelte Linie zur Unterscheidung
+            ax2.errorbar(
+                x,
+                m_mean,
+                yerr=m_std,
+                marker="s",
+                linestyle="--",
+                capsize=3,
+                label=f"{strat_name} (movements)",
+            )
+
+        ax1.set_xlabel("Number of Qubits")
+        ax1.set_ylabel("Timesteps")
+        ax2.set_ylabel("Movements")
+
+        ax1.set_title(title)
+        ax1.set_xticks(n_qubits_list)
+        ax1.grid(True, which="both", linestyle="--", alpha=0.4)
+
+        # Kombinierte Legend (beide Achsen)
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        legend = ax1.legend(
+            h1 + h2,
+            l1 + l2,
+            loc="best",
+            fontsize=9,
+            frameon=True,
+        )
+        legend.get_frame().set_facecolor("white")
+        legend.get_frame().set_edgecolor("black")   # optional, aber meist hübsch
+        legend.get_frame().set_alpha(1.0) 
+
+
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=300)
+        plt.show()
+
+
+def plot_two_axis_no_errorbars(
+    n_qubits_list: List[int],
+    results: Dict[str, Dict[int, Dict[str, float]]],
+    out_png: str,
+    title: str,
+) -> None:
+    with plt.style.context(["science", "nature"]):
+        plt.rcParams.update({
+            "font.size": 11,        # Grundschrift
+            "axes.labelsize": 11,   # Achsenbeschriftung
+            "axes.titlesize": 11,   # Titel
+            "xtick.labelsize": 11,  # Tick Labels
+            "ytick.labelsize": 11,
+            "legend.fontsize": 11, # Legende
         })
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+        ax2 = ax1.twinx()
 
-        # Falls durch Ausreißer/NaNs alles weg wäre, Überspringen
-        if agg.empty:
-            continue
+        for strat_name, per_nq in results.items():
+            x = np.array(n_qubits_list, dtype=float)
 
-        # ---------- Movements ----------
-        plt.figure()
-        for algo in sorted(agg["algo"].unique()):
-            sub = agg[agg["algo"] == algo]
-            plt.plot(sub["n_qubits"], sub["movements"], marker="o", label=algo)
-        plt.xlabel("n_qubits")
-        plt.ylabel("mean movements")
-        plt.title(f"Mean movements vs n_qubits ({w}x{h})")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(f"{out_prefix}_{w}x{h}_movements.png", dpi=150)
-        plt.close()
+            t_mean = np.array(
+                [per_nq.get(nq, {}).get("timesteps_mean", np.nan) for nq in n_qubits_list],
+                dtype=float,
+            )
+            m_mean = np.array(
+                [per_nq.get(nq, {}).get("movements_mean", np.nan) for nq in n_qubits_list],
+                dtype=float,
+            )
 
-        # ---------- Timesteps ----------
-        plt.figure()
-        for algo in sorted(agg["algo"].unique()):
-            sub = agg[agg["algo"] == algo]
-            plt.plot(sub["n_qubits"], sub["timesteps"], marker="o", label=algo)
-        plt.xlabel("n_qubits")
-        plt.ylabel("mean timesteps")
-        plt.title(f"Mean timesteps vs n_qubits ({w}x{h})")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(f"{out_prefix}_{w}x{h}_timesteps.png", dpi=150)
-        plt.close()
+            # Timesteps (linke Achse)
+            ax1.plot(
+                x,
+                t_mean,
+                marker="o",
+                linestyle="-",
+                color = "#ed9015" if strat_name == "Rotation Algorithm with Waiting" else "tab:blue",
+                label=f"{strat_name} (Timesteps)",
+            )
 
-        # ---------- Runtime ----------
-        plt.figure()
-        for algo in sorted(agg["algo"].unique()):
-            sub = agg[agg["algo"] == algo]
-            plt.plot(sub["n_qubits"], sub["runtime_s"], marker="o", label=algo)
-        plt.xlabel("n_qubits")
-        plt.ylabel("mean runtime (s)")
-        plt.title(f"Mean runtime vs n_qubits ({w}x{h})")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(f"{out_prefix}_{w}x{h}_runtime.png", dpi=150)
-        plt.close()
+            # Movements (rechte Achse)
+            ax2.plot(
+                x,
+                m_mean,
+                marker="s",
+                linestyle="--",
+                color = "#ed9015" if strat_name == "Rotation Algorithm with Waiting" else "tab:blue",
+                label=f"{strat_name} (Movements)",
+            )
 
-        # ---------- Exception rate ----------
-        plt.figure()
-        for algo in sorted(agg["algo"].unique()):
-            sub = agg[agg["algo"] == algo]
-            plt.plot(sub["n_qubits"], sub["exception"], marker="o", label=algo)
-        plt.xlabel("n_qubits")
-        plt.ylabel("exception rate")
-        plt.title(f"Exception rate vs n_qubits ({w}x{h})")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(f"{out_prefix}_{w}x{h}_exception_rate.png", dpi=150)
-        plt.close()
+        ax1.set_xlabel("Number of Qubits", labelpad=10)
+        ax1.set_ylabel("Mean Timesteps", labelpad=12)
+        ax2.set_ylabel("Mean Movements", labelpad=12)
+
+        ax1.set_title(title)
+        ax1.set_xticks(n_qubits_list)
+        ax1.grid(True, which="both", linestyle="--", alpha=0.4)
+
+        # Kombinierte Legend (beide Achsen)
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        legend = ax1.legend(
+            h1 + h2,
+            l1 + l2,
+            loc="best",
+            borderaxespad=1.5,
+            borderpad=0.8, 
+            frameon=True,
+        )
+        legend.get_frame().set_facecolor("white")
+        legend.get_frame().set_edgecolor("black")   # optional, aber meist hübsch
+        legend.get_frame().set_alpha(1.0) 
+
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=300)
+        plt.show()
 
 
 
 def main():
-    df = evaluate(
-        max_size=4,
-        rounds=5,
-        base_seed=42,
-        n_seed_samples=20,
-        p_success=0.98,
-        p_repair=0.25,
-        limit_qubits=None,
-    )
-    df.to_csv("eval_results.csv", index=False)
-    make_plots(df, out_prefix="eval")
-    print("Wrote eval_results.csv and plots with prefix eval_*.png")
+    # -----------------------
+    # Experiment-Parameter
+    # -----------------------
+    width, height = 3, 3
+    rounds = 5
+    p_success = 0.99
+    p_repair = 0.25
+    n_samples = 50
 
+    # Qubit-Spanne: du kannst das hier anpassen
+    n_qubits_list = list(range(2, 25))  # 2..24
 
-# --- NEU/GEÄNDERT: Utility für inklusiven Zahlenbereich ---
-def _range_inclusive(start: float, stop: float, step: float) -> List[float]:
-    if step <= 0:
-        raise ValueError("step must be > 0")
-    k = int(round((stop - start) / step))
-    xs = [round(start + i * step, 10) for i in range(k + 1)]
-    # Falls durch Rundung der Endpunkt knapp verfehlt wird, füge ihn hinzu
-    if xs and abs(xs[-1] - stop) > 1e-9 and stop > xs[-1]:
-        xs.append(round(stop, 10))
-    return sorted([x for x in xs if x >= start - 1e-12 and x <= stop + 1e-12])
+    csv_path = "results_strategy_3x3.csv"
+    plot_path = "strategy_3x3_timesteps_movements.pdf"
 
-# --- ERSETZT die alte param_grid(...) ---
-def param_grid(
-    ps_start: float = 0.05, ps_stop: float = 1.0, ps_step: float = 0.05,
-    pr_start: Optional[float] = None, pr_stop: Optional[float] = None, pr_step: Optional[float] = None,
-) -> List[Tuple[float, float]]:
-    """
-    Liefert alle (p_success, p_repair)-Kombinationen mit getrennten Rastern.
-    Wenn pr_* nicht gesetzt ist, wird das p_success-Raster übernommen.
-    """
-    if pr_start is None: pr_start = ps_start
-    if pr_stop  is None: pr_stop  = ps_stop
-    if pr_step  is None: pr_step  = ps_step
+    # Wenn CSV schon existiert, laden wir sie (damit du plotten kannst ohne neu zu simulieren).
+    existing = load_results_csv(csv_path)
 
-    ps_vals = _range_inclusive(ps_start, ps_stop, ps_step)
-    pr_vals = _range_inclusive(pr_start, pr_stop, pr_step)
+    strategies = {
+        "Default": DefaultRoutingPlanner(),
+        "Rotation": RotationRoutingPlanner(),
+    }
 
-    return [(float(ps), float(pr)) for ps in ps_vals for pr in pr_vals]
-
-# --- SIGNATUR/LOGIK anpassen, damit getrennte Rasters & mehrere Circuits laufen ---
-def evaluate_fixed_circuit_ps_pr(
-    width: int = 2,
-    height: int = 2,
-    n_qubits: int = 4,
-    rounds: int = 5,
-    seed: int = 44,  # Basis-Seed; pro Circuit wird offsettet
-    # getrennte Parameter-Raster:
-    ps_start: float = 0.05,
-    ps_stop: float = 1.0,
-    ps_step: float = 0.05,
-    pr_start: Optional[float] = None,
-    pr_stop: Optional[float] = None,
-    pr_step: Optional[float] = None,
-    # NEU: mehrere Circuits je (ps, pr)
-    n_circuits: int = 10,
-    out_prefix: str = "pspr_eval"
-) -> pd.DataFrame:
-    """
-    Sweep über getrennte Rasters für p_success (ps_*) und p_repair (pr_*).
-    Für jedes (ps, pr) werden n_circuits verschiedene Circuits (neue Platzierungen+Paare) getestet.
-    Schreibt:
-      - {out_prefix}_results.csv (RAW, alle Replikate)
-      - {out_prefix}_means.csv   (pro algo, ps, pr gemittelt)
-      - Heatmaps (aus den Mittelwerten)
-    """
-    # Netzwerk fixieren (nur die Circuits variieren)
-    G = NetworkBuilder.build_network(width, height)
-    sn_nodes = [n for n in G.nodes if G.nodes[n].get("type") == "SN"]
-    if n_qubits > len(sn_nodes):
-        raise ValueError(
-            f"Requested {n_qubits} qubits but only {len(sn_nodes)} SN nodes exist in a {width}x{height} network."
+    # -----------------------
+    # Falls Daten fehlen: evaluieren + in CSV schreiben
+    # -----------------------
+    for strat_name, strat in strategies.items():
+        missing_any = (
+            strat_name not in existing
+            or any(nq not in existing[strat_name] for nq in n_qubits_list)
         )
+        if missing_any:
+            # optional: wenn schon alte Daten drin sind, nicht doppelt schreiben:
+            # => wir schreiben nur die NQs, die fehlen
+            already = existing.get(strat_name, {})
+            todo_nqs = [nq for nq in n_qubits_list if nq not in already]
+            if not todo_nqs:
+                continue
 
-    combos = param_grid(
-        ps_start=ps_start, ps_stop=ps_stop, ps_step=ps_step,
-        pr_start=pr_start, pr_stop=pr_stop, pr_step=pr_step
+            t_mean, t_std, m_mean, m_std, n_success = evaluate_strategy_with_errorbars(
+                routing_strategy=strat,
+                n_qubits_list=todo_nqs,
+                n_samples=n_samples,
+                width=width,
+                height=height,
+                rounds=rounds,
+                p_success=p_success,
+                p_repair=p_repair,
+            )
+
+            save_results_csv(
+                path=csv_path,
+                n_qubits_list=todo_nqs,
+                strategy_name=strat_name,
+                timesteps_mean=t_mean,
+                timesteps_std=t_std,
+                movements_mean=m_mean,
+                movements_std=m_std,
+                n_success=n_success,
+                n_samples=n_samples,
+            )
+
+            # reload to include newly written rows
+            existing = load_results_csv(csv_path)
+
+    # -----------------------
+    # Plot aus CSV (immer)
+    # -----------------------
+    plot_two_axis_no_errorbars(
+        n_qubits_list=n_qubits_list,
+        results={
+            "Path Algorithm with Waiting": existing.get("Default", {}),
+            "Rotation Algorithm with Waiting": existing.get("Rotation", {}),
+        },
+        out_png=plot_path,
+        title="",
     )
-    total_runs = len(combos) * 2 * n_circuits  # 2 Planner * Replikate
-    print(f"Total (p_success, p_repair) combos: {len(combos)}; runs (with {n_circuits} circuits each, 2 algos): {total_runs}")
 
-    records = []
-    run_idx = 0
-
-    for (ps, pr) in combos:
-        for circuit_idx in range(n_circuits):
-            # pro Circuit neue Platzierungen/Paare (Seed variieren)
-            seed_used = seed + circuit_idx
-            qubits, pairs = pick_qubits_and_pairs(G, n_qubits=n_qubits, rounds=rounds, seed=seed_used)
-
-            for algo_name, PlannerClass in [
-                ("Default", DefaultRoutingPlanner),
-                ("Reroute", RerouteRoutingPlanner),
-            ]:
-                run_idx += 1
-                print(
-                    f"[{run_idx:5d}/{total_runs}] ps={ps:.2f}, pr={pr:.2f}, "
-                    f"circuit={circuit_idx+1}/{n_circuits}, algo={algo_name} ... ",
-                    end=""
-                )
-                sys.stdout.flush()
-                try:
-                    m = run_one(PlannerClass, G, qubits, pairs, p_success=ps, p_repair=pr)
-                    status = "OK"
-                except Exception as e:
-                    m = {"movements": np.nan, "timesteps": np.nan, "runtime_s": np.nan, "exception": 1}
-                    status = f"FAIL ({type(e).__name__})"
-
-                records.append({
-                    "algo": algo_name,
-                    "width": width,
-                    "height": height,
-                    "n_qubits": n_qubits,
-                    "rounds": rounds,
-                    "seed_base": seed,
-                    "seed_used": seed_used,
-                    "circuit_idx": circuit_idx,
-                    "p_success": ps,
-                    "p_repair": pr,
-                    **m
-                })
-                print(status)
-
-    df = pd.DataFrame.from_records(records)
-    raw_csv = f"{out_prefix}_results.csv"
-    df.to_csv(raw_csv, index=False)
-    print(f"Wrote {raw_csv}")
-
-    # --- Mittelwerte je (algo, ps, pr) berechnen ---
-    group_cols = ["algo", "width", "height", "n_qubits", "rounds", "p_success", "p_repair"]
-    metrics = ["movements", "timesteps", "runtime_s", "exception"]
-    df_means = (
-        df.groupby(group_cols, as_index=False)[metrics]
-          .mean(numeric_only=True)
-          .rename(columns={"exception": "exception_rate"})
-    )
-    mean_csv = f"{out_prefix}_means.csv"
-    df_means.to_csv(mean_csv, index=False)
-    print(f"Wrote {mean_csv}")
-
-    # ---- Heatmaps (aus den Mittelwerten) ----
-    def _plot_heatmap(df_algo: pd.DataFrame, metric: str, title: str, out_path: str):
-        d = df_algo.pivot_table(index="p_success", columns="p_repair", values=metric, aggfunc="mean")
-        d = d.sort_index().sort_index(axis=1)
-        plt.figure()
-        im = plt.imshow(
-            d.values, aspect="auto", origin="lower",
-            extent=[d.columns.min(), d.columns.max(), d.index.min(), d.index.max()]
-        )
-        plt.colorbar(im, label=metric)
-        plt.xlabel("p_repair")
-        plt.ylabel("p_success")
-        plt.title(title)
-        xticks = np.round(np.linspace(d.columns.min(), d.columns.max(), 8), 2)
-        yticks = np.round(np.linspace(d.index.min(), d.index.max(), 8), 2)
-        plt.xticks(xticks)
-        plt.yticks(yticks)
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=150)
-        plt.close()
-
-    for algo in sorted(df_means["algo"].unique()):
-        df_a = df_means[df_means["algo"] == algo]
-        _plot_heatmap(df_a, "movements",
-                      f"Mean movements ({width}x{height}, {n_qubits} qubits) – {algo}",
-                      f"{out_prefix}_{algo}_movements.png")
-        _plot_heatmap(df_a, "timesteps",
-                      f"Mean timesteps ({width}x{height}, {n_qubits} qubits) – {algo}",
-                      f"{out_prefix}_{algo}_timesteps.png")
-        _plot_heatmap(df_a, "runtime_s",
-                      f"Mean runtime (s) ({width}x{height}, {n_qubits} qubits) – {algo}",
-                      f"{out_prefix}_{algo}_runtime.png")
-        _plot_heatmap(df_a, "exception_rate",
-                      f"Exception rate ({width}x{height}, {n_qubits} qubits) – {algo}",
-                      f"{out_prefix}_{algo}_exception_rate.png")
-
-    print("Wrote heatmaps with prefix "
-          f"{out_prefix}_<algo>_{{movements,timesteps,runtime,exception_rate}}.png")
-
-    return df
-
+    print(f"\nCSV gespeichert unter: {os.path.abspath(csv_path)}")
+    print(f"Plot gespeichert unter: {os.path.abspath(plot_path)}")
 
 
 if __name__ == "__main__":
-    evaluate_fixed_circuit_ps_pr(
-        width=2,
-        height=2,
-        n_qubits=4,
-        rounds=5,
-        seed=42,
-        ps_start=0.90, ps_stop=1.00, ps_step=0.01,  # p_success: 0.90 .. 1.00
-        pr_start=0.10, pr_stop=1.00, pr_step=0.10,  # p_repair: 0.10 .. 1.00
-        n_circuits=10,                               # <<— 10 Circuits pro (ps, pr)
-        out_prefix="pspr_eval"
-    )
+    main()

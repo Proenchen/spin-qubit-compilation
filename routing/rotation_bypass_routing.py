@@ -11,6 +11,8 @@ from routing.rotation_routing import RotationRoutingPlanner
 from collections import deque
 
 
+MAX_WAIT_TIME = 100
+
 def chebyshev(p: Coord, q: Coord) -> int:
     return max(abs(p[0] - q[0]), abs(p[1] - q[1]))
 
@@ -716,194 +718,6 @@ class CircleRotationRoutingPlanner:
 
 class HybridRotationRoutingPlanner(RoutingStrategy):
     """
-    Hybrid router between RotationRoutingPlanner (diamonds) and
-    CircleRotationRoutingPlanner (8-cycles).
-
-    Behaviour (per current pair set = all qubits in this call):
-
-      1. Run RotationRoutingPlanner.route(...)
-      2. Compute defect-wait ticks *only for the current pair set* (here:
-         all qubits in `qubits`).
-         A defect-wait tick for a given set of qids means:
-           - there is at least one defective edge in that tick, AND
-           - none of those qids moved in that tick.
-      3. If there are **no** defect-wait ticks for that set, return the
-         Rotation result.
-      4. Otherwise, restore RNG state and run CircleRotationRoutingPlanner.
-      5. Again compute defect-wait ticks, but only over the same set of qids.
-         - If Circle has **no** defect waits for that set, use Circle.
-         - If both have defect waits, choose the one with fewer such ticks
-           (again, only counting them for this pair set).
-
-    Notes:
-      - "current pair(s)" in this top-level planner means: all qubits
-        involved in this Hybrid `route` call. The helper methods
-        `_has_defect_wait_for_qids` and `_count_defect_waits_for_qids`
-        are written so you can later call them for *individual pairs* or
-        *parallel groups of pairs* if you move the hybrid logic inside the
-        lower-level planners.
-      - This class does not mix both algorithms inside a single run; it
-        chooses which full plan (rotation vs circle) to use based on the
-        defect behaviour for the given qid subset.
-    """
-
-    def __init__(
-        self,
-        rotation_cls: type[RotationRoutingPlanner] = RotationRoutingPlanner,
-        circle_cls: type[CircleRotationRoutingPlanner] = CircleRotationRoutingPlanner,
-    ) -> None:
-        self._rotation_cls = rotation_cls
-        self._circle_cls = circle_cls
-
-    # ----------------- pair(s)-local defect detection -----------------
-
-    @staticmethod
-    def _has_defect_wait_for_qids(
-        qids: Set[int],
-        timelines: Dict[int, List[TimedNode]],
-        edge_timebands: List[Tuple[int, int, Set[frozenset]]],
-    ) -> bool:
-        """
-        Returns True iff there is at least one tick with:
-          - defective edges present, AND
-          - none of the given qids moved in that tick.
-
-        This is a *local* version of the original _has_defect_wait, applied
-        only to the specified qids (current pair(s)), not to all qubits.
-        """
-        if not edge_timebands:
-            return False
-
-        T = len(edge_timebands)
-
-        # We assume timelines[qid] has length T+1 (t=0,...,T)
-        for k in range(T):
-            _t0, _t1, defects = edge_timebands[k]
-            if not defects:
-                continue
-
-            any_moved = False
-            for qid in qids:
-                # Safety guard: if timeline shorter than expected, skip that qid
-                if k + 1 >= len(timelines[qid]):
-                    continue
-                pos_before = timelines[qid][k][0]
-                pos_after = timelines[qid][k + 1][0]
-                if pos_before != pos_after:
-                    any_moved = True
-                    break
-
-            if not any_moved:
-                return True
-
-        return False
-
-    @staticmethod
-    def _count_defect_waits_for_qids(
-        qids: Set[int],
-        timelines: Dict[int, List[TimedNode]],
-        edge_timebands: List[Tuple[int, int, Set[frozenset]]],
-    ) -> int:
-        """
-        Counts how many ticks are defect-wait ticks *for the given qids only*.
-
-        A defect-wait tick for the subset `qids` is defined as:
-          - defective edges present in that tick, AND
-          - none of the qids in `qids` moves in that tick.
-        """
-        if not edge_timebands:
-            return 0
-
-        T = len(edge_timebands)
-        count = 0
-
-        for k in range(T):
-            _t0, _t1, defects = edge_timebands[k]
-            if not defects:
-                continue
-
-            any_moved = False
-            for qid in qids:
-                if k + 1 >= len(timelines[qid]):
-                    continue
-                pos_before = timelines[qid][k][0]
-                pos_after = timelines[qid][k + 1][0]
-                if pos_before != pos_after:
-                    any_moved = True
-                    break
-
-            if not any_moved:
-                count += 1
-
-        return count
-
-    # -------------------------- main API --------------------------
-
-    def route(
-        self,
-        G: nx.Graph,
-        qubits: List[Qubit],
-        pairs: List[Tuple[Qubit, Qubit]],
-        p_success: float,
-        p_repair: float,
-    ):
-        # The "current pair set" for this top-level planner is all qubits
-        # involved in this call.
-        current_qids: Set[int] = {q.id for q in qubits}
-
-        # Save RNG state so CircleRouting sees the same base random sequence
-        # (even though control flow diverges, this keeps runs reproducible).
-        rng_state_before = random.getstate()
-
-        # 1) Run RotationRoutingPlanner
-        rot_planner = self._rotation_cls()
-        timelines_rot, edge_timebands_rot = rot_planner.route(
-            G, qubits, pairs, p_success, p_repair
-        )
-
-        has_rot_wait = self._has_defect_wait_for_qids(
-            current_qids, timelines_rot, edge_timebands_rot
-        )
-
-        # If rotation has no defect-wait ticks for the current pair set,
-        # we simply return that plan.
-        if not has_rot_wait:
-            return timelines_rot, edge_timebands_rot
-
-        # 2) Rotation incurred defect-waits -> try CircleRouting for the
-        #    same pair set with the same initial RNG state.
-        random.setstate(rng_state_before)
-        circ_planner = self._circle_cls()
-        timelines_circ, edge_timebands_circ = circ_planner.route(
-            G, qubits, pairs, p_success, p_repair
-        )
-
-        has_circ_wait = self._has_defect_wait_for_qids(
-            current_qids, timelines_circ, edge_timebands_circ
-        )
-
-        # If Circle has no defect-waits for the current pair set, prefer it.
-        if not has_circ_wait:
-            return timelines_circ, edge_timebands_circ
-
-        # 3) Both variants have some defect-wait ticks for these qids:
-        #    choose the one with fewer such ticks (again only for these qids).
-        rot_waits = self._count_defect_waits_for_qids(
-            current_qids, timelines_rot, edge_timebands_rot
-        )
-        circ_waits = self._count_defect_waits_for_qids(
-            current_qids, timelines_circ, edge_timebands_circ
-        )
-
-        if circ_waits < rot_waits:
-            return timelines_circ, edge_timebands_circ
-
-        return timelines_rot, edge_timebands_rot
-
-
-
-class HybridRotationRoutingPlanner(RoutingStrategy):
-    """
     Hybrid planner:
 
     - Works like RotationRoutingPlanner by default (diamond-based rotations).
@@ -941,6 +755,8 @@ class HybridRotationRoutingPlanner(RoutingStrategy):
         defective_edges: Set[frozenset] = set()
         edge_timebands: List[Tuple[int, int, Set[frozenset]]] = []
 
+        wait_streak = 0
+
         # ---------- Knotentyp ----------
         def _is_sn(n: Coord) -> bool:
             return G.nodes[n].get("type") == "SN"
@@ -968,7 +784,7 @@ class HybridRotationRoutingPlanner(RoutingStrategy):
             return False
 
         def _commit_tick(pending: Dict[int, Coord], *, sample: bool) -> bool:
-            nonlocal t
+            nonlocal t, wait_streak
             if sample:
                 _sample_edge_failures()
             moved = False
@@ -976,6 +792,13 @@ class HybridRotationRoutingPlanner(RoutingStrategy):
                 for qid, newp in pending.items():
                     current_pos[qid] = newp
                 moved = True
+
+            # Wartezyklen-Zähler aktualisieren
+            if moved:
+                wait_streak = 0
+            else:
+                wait_streak += 1
+
             # Zeit schreitet immer fort (Wartetick sonst)
             t += 1
             for qid in all_qids:
@@ -984,7 +807,17 @@ class HybridRotationRoutingPlanner(RoutingStrategy):
                 if last != cur:
                     timelines[qid].append(cur)
             edge_timebands.append((t - 1, t, set(defective_edges)))
+
+            # Wenn wir MAX_WAIT_TIME Ticks am Stück nicht bewegt haben -> Exception
+            if wait_streak >= MAX_WAIT_TIME:
+                raise RuntimeError(
+                    f"Routing stuck (Hybrid): {wait_streak} aufeinanderfolgende Timesteps "
+                    f"ohne Bewegung (t={t})."
+                )
+
             return moved
+
+
 
         # ---------- Rauten/Rotation ----------
         def _is_diag(u: Coord, v: Coord) -> bool:

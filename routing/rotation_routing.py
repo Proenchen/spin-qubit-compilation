@@ -8,6 +8,9 @@ from routing.default_routing import DefaultRoutingPlanner
 from routing.routing_strategy import RoutingStrategy
 
 # ------------------------- Utils -------------------------
+MAX_WAIT_TIME = 100
+
+
 def chebyshev(p: Coord, q: Coord) -> int:
     return max(abs(p[0] - q[0]), abs(p[1] - q[1]))
 
@@ -61,6 +64,8 @@ class RotationRoutingPlanner(RoutingStrategy):
         defective_edges: Set[frozenset] = set()
         edge_timebands: List[Tuple[int, int, Set[frozenset]]] = []
 
+        wait_streak = 0
+
         # ---------- Knotentyp ----------
         def _is_sn(n: Coord) -> bool:
             return G.nodes[n].get("type") == "SN"
@@ -88,7 +93,7 @@ class RotationRoutingPlanner(RoutingStrategy):
             return False
 
         def _commit_tick(pending: Dict[int, Coord], *, sample: bool) -> bool:
-            nonlocal t
+            nonlocal t, wait_streak
             if sample:
                 _sample_edge_failures()
             moved = False
@@ -96,6 +101,13 @@ class RotationRoutingPlanner(RoutingStrategy):
                 for qid, newp in pending.items():
                     current_pos[qid] = newp
                 moved = True
+
+            # Wartezyklen-Zähler aktualisieren
+            if moved:
+                wait_streak = 0
+            else:
+                wait_streak += 1
+
             # Zeit schreitet immer fort (Wartetick sonst)
             t += 1
             for qid in all_qids:
@@ -104,6 +116,14 @@ class RotationRoutingPlanner(RoutingStrategy):
                 if last != cur:
                     timelines[qid].append(cur)
             edge_timebands.append((t - 1, t, set(defective_edges)))
+
+            # Wenn wir 20 Ticks am Stück nicht bewegt haben -> Exception
+            if wait_streak >= MAX_WAIT_TIME:
+                raise RuntimeError(
+                    f"Routing stuck: {wait_streak} aufeinanderfolgende Timesteps "
+                    f"ohne Bewegung (t={t})."
+                )
+
             return moved
 
         # ---------- Rauten/Rotation ----------

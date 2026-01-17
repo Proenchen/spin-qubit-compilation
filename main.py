@@ -17,8 +17,8 @@ from simulation import SimulationConfig, RoutingSimulator
 
 if __name__ == "__main__":
 
-    placement: PlacementStrategy = InteractionPlacementStrategy()
-    routing: RoutingStrategy = HybridRotationRoutingPlanner()
+    placement: PlacementStrategy = RandomPlacementStrategy()
+    routing: RoutingStrategy = DefaultRoutingPlanner()
 
     # For defective edges
     random.seed(5)
@@ -26,7 +26,7 @@ if __name__ == "__main__":
     config = SimulationConfig(
         width=3,
         height=3,
-        n_qubits=24,
+        n_qubits=8,
         rounds=3,
         p_success=0.99,
         p_repair=0.05,
