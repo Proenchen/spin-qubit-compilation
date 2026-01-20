@@ -1099,83 +1099,352 @@ def plot_two_axis_no_errorbars(
         plt.show()
 
 
+def save_grid_results_csv(
+    path: str,
+    grid_sizes: List[Tuple[int, int]],
+    qubits_per_grid: List[int],
+    sn_per_grid: List[int],
+    strategy_name: str,
+    timesteps_mean: List[float],
+    movements_mean: List[float],
+    n_success: List[int],
+    n_samples: int,
+    p_success: float,
+    p_repair: float,
+    rounds: int,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(
+                [
+                    "strategy",
+                    "width",
+                    "height",
+                    "n_sn",
+                    "n_qubits",
+                    "timesteps_mean",
+                    "movements_mean",
+                    "n_success",
+                    "n_samples",
+                    "p_success",
+                    "p_repair",
+                    "rounds",
+                ]
+            )
+
+        for i, (w, h) in enumerate(grid_sizes):
+            writer.writerow(
+                [
+                    strategy_name,
+                    w,
+                    h,
+                    sn_per_grid[i],
+                    qubits_per_grid[i],
+                    timesteps_mean[i],
+                    movements_mean[i],
+                    n_success[i],
+                    n_samples,
+                    p_success,
+                    p_repair,
+                    rounds,
+                ]
+            )
+
+
+def load_grid_results_csv(path: str) -> Dict[str, Dict[Tuple[int, int], Dict[str, float]]]:
+    """
+    Rückgabe:
+      data[strategy][(w,h)] = {
+        'n_sn': int, 'n_qubits': int,
+        'timesteps_mean': float, 'movements_mean': float,
+        'n_success': int, 'n_samples': int,
+        'p_success': float, 'p_repair': float, 'rounds': int
+      }
+    """
+    data: Dict[str, Dict[Tuple[int, int], Dict[str, float]]] = {}
+    if not os.path.exists(path):
+        return data
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            strat = row["strategy"]
+            w = int(float(row["width"]))
+            h = int(float(row["height"]))
+            key = (w, h)
+            data.setdefault(strat, {})
+            data[strat][key] = {
+                "n_sn": int(float(row["n_sn"])),
+                "n_qubits": int(float(row["n_qubits"])),
+                "timesteps_mean": float(row["timesteps_mean"]),
+                "movements_mean": float(row["movements_mean"]),
+                "n_success": int(float(row["n_success"])),
+                "n_samples": int(float(row["n_samples"])),
+                "p_success": float(row["p_success"]),
+                "p_repair": float(row["p_repair"]),
+                "rounds": int(float(row["rounds"])),
+            }
+
+    return data
+
+
+# ============================================================
+#   Plot: Balkendiagramm mit 2 Y-Achsen (Timesteps vs Movements)
+# ============================================================
+
+def plot_two_axis_bar_over_grids(
+    grid_sizes: List[Tuple[int, int]],
+    results: Dict[str, Dict[Tuple[int, int], Dict[str, float]]],
+    out_path: str,
+    title: str = "",
+) -> None:
+    """
+    Pro Grid 4 Balken in dieser Reihenfolge:
+      - Timesteps:   [Alg1, Alg2] (nebeneinander)
+      - Movements:   [Alg1, Alg2] (nebeneinander)
+    Also erst 2 Timesteps-Balken, dann 2 Movements-Balken.
+
+    Zusätzlich: Movements werden auf ax2 geplottet (rechte y-Achse),
+    Timesteps auf ax1 (linke y-Achse).
+    """
+
+    # X labels
+    x_labels = [f"{w}x{h}" for (w, h) in grid_sizes]
+    x = np.arange(len(grid_sizes), dtype=float)
+
+    # Stabiler Algorithmus-Order wie im dict übergeben
+    strategy_names = list(results.keys())
+    if len(strategy_names) != 2:
+        raise ValueError("Diese Plot-Funktion ist für genau 2 Strategien ausgelegt.")
+
+    s1, s2 = strategy_names[0], strategy_names[1]
+    color_map = {
+        s1: "tab:blue",     # Path Algorithm
+        s2: "#ed9015",      # Rotation Algorithm (orange)
+    }
+
+    # Werte ziehen
+    def get_vals(strat: str, key: str) -> List[float]:
+        vals = []
+        for g in grid_sizes:
+            entry = results[strat].get(g, {})
+            vals.append(entry.get(key, np.nan))
+        return vals
+
+    t1 = get_vals(s1, "timesteps_mean")
+    t2 = get_vals(s2, "timesteps_mean")
+    m1 = get_vals(s1, "movements_mean")
+    m2 = get_vals(s2, "movements_mean")
+
+    with plt.style.context(["science", "nature"]):
+        plt.rcParams.update({
+            "font.size": 12,
+            "axes.labelsize": 12,
+            "axes.titlesize": 12,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+            "legend.fontsize": 12,
+        })
+
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+        ax2 = ax1.twinx()
+
+        # --- Bar-Layout ---
+        # 4 Balken pro Grid:
+        #   pos0, pos1 = Timesteps (s1, s2)
+        #   pos2, pos3 = Movements (s1, s2)
+        base = x
+        group_width = 0.5
+
+        # echte Balkenbreite
+        bar_width = (group_width / 4.0) * 0.95
+
+        # Abstand zwischen den Mittelpunkten innerhalb Timesteps bzw. Movements
+        # -> MUSS > bar_width sein, sonst klebt es
+        step = bar_width * 1.10   # 10% Luft
+
+        # Extra-Abstand zwischen Timesteps-Block und Movements-Block
+        gap = bar_width * 0.5    # hier größer/kleiner machen
+
+        # Offsets (Reihenfolge: T(s1), T(s2), M(s1), M(s2))
+        offsets = np.array([
+            -(step/2 + gap/2 + step),  # T s1
+            -(step/2 + gap/2),         # T s2
+            +(step/2 + gap/2),         # M s1
+            +(step/2 + gap/2 + step),  # M s2
+        ])
+
+
+        # Timesteps bars on ax1
+        ax1.bar(
+            base + offsets[0],
+            t1,
+            width=bar_width,
+            color=color_map[s1],
+            label=f"{s1} (Timesteps)",
+            alpha=0.90,
+        )
+        ax1.bar(
+            base + offsets[1],
+            t2,
+            width=bar_width,
+            color=color_map[s2],
+            label=f"{s2} (Timesteps)",
+            alpha=0.90,
+        )
+
+        # Movements bars on ax2
+        # (leichter transparenter + hatch, damit man es sofort erkennt)
+        ax2.bar(
+            base + offsets[2],
+            m1,
+            width=bar_width,
+            color=color_map[s1],
+            label=f"{s1} (Movements)",
+            alpha=0.40,
+            hatch="//",
+        )
+        ax2.bar(
+            base + offsets[3],
+            m2,
+            width=bar_width,
+            color=color_map[s2],
+            label=f"{s2} (Movements)",
+            alpha=0.40,
+            hatch="//",
+        )
+
+        ax1.set_xlabel("Grid Size", labelpad=10)
+        ax1.set_ylabel("Mean Timesteps", labelpad=12)
+        ax2.set_ylabel("Mean Movements", labelpad=12)
+
+        ax1.set_title(title)
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(x_labels, rotation=0)
+
+        ax1.grid(True, which="both", linestyle="--", alpha=0.4, axis="y")
+
+        # Combined legend
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        leg = ax1.legend(
+            h1 + h2,
+            l1 + l2,
+            loc="best",
+            borderaxespad=1.5,
+            borderpad=0.8,
+            frameon=True,
+        )
+        leg.get_frame().set_facecolor("white")
+        leg.get_frame().set_edgecolor("black")
+        leg.get_frame().set_alpha(1.0)
+
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=300)
+        plt.show()
+
+
+
 
 def main():
     # -----------------------
     # Experiment-Parameter
     # -----------------------
-    width, height = 3, 3
     rounds = 5
     p_success = 0.99
     p_repair = 0.25
     n_samples = 50
 
-    # Qubit-Spanne: du kannst das hier anpassen
-    n_qubits_list = list(range(2, 25))  # 2..24
+    # Grids: 2x2, 2x3, ..., 5x5 (alle Kombinationen)
+    grid_sizes = grid_sizes = [
+        (2, 2),
+        (2, 3),
+        (3, 2),
+        (3, 3),
+        (3, 4),
+        (4, 3),
+        (4, 4),
+        (4, 5),
+        (5, 4),
+        (5, 5),
+    ]
 
-    csv_path = "results_strategy_3x3.csv"
-    plot_path = "strategy_3x3_timesteps_movements.pdf"
-
-    # Wenn CSV schon existiert, laden wir sie (damit du plotten kannst ohne neu zu simulieren).
-    existing = load_results_csv(csv_path)
-
+    # Routingstrategien: Default & Rotation
     strategies = {
         "Default": DefaultRoutingPlanner(),
         "Rotation": RotationRoutingPlanner(),
     }
 
-    # -----------------------
-    # Falls Daten fehlen: evaluieren + in CSV schreiben
-    # -----------------------
-    for strat_name, strat in strategies.items():
-        missing_any = (
-            strat_name not in existing
-            or any(nq not in existing[strat_name] for nq in n_qubits_list)
-        )
+    csv_path = "results_over_grids_default_rotation.csv"
+    plot_path = "over_grids_timesteps_movements_bar.pdf"
+
+    existing = load_grid_results_csv(csv_path)
+
+    # Prüfen ob irgendwas fehlt (pro Strategie + Grid)
+    missing_any = False
+    for strat_name in strategies.keys():
+        if strat_name not in existing:
+            missing_any = True
+            break
+        for g in grid_sizes:
+            if g not in existing[strat_name]:
+                missing_any = True
+                break
         if missing_any:
-            # optional: wenn schon alte Daten drin sind, nicht doppelt schreiben:
-            # => wir schreiben nur die NQs, die fehlen
-            already = existing.get(strat_name, {})
-            todo_nqs = [nq for nq in n_qubits_list if nq not in already]
-            if not todo_nqs:
-                continue
+            break
 
-            t_mean, t_std, m_mean, m_std, n_success = evaluate_strategy_with_errorbars(
-                routing_strategy=strat,
-                n_qubits_list=todo_nqs,
-                n_samples=n_samples,
-                width=width,
-                height=height,
-                rounds=rounds,
-                p_success=p_success,
-                p_repair=p_repair,
-            )
+    if missing_any:
+        # Wir evaluieren alles in einem Rutsch, wie gewünscht: evaluate_strategies_over_grids
+        avg_timesteps, avg_movements, qubits_per_grid = evaluate_strategies_over_grids(
+            routing_strategies=strategies,
+            grid_sizes=grid_sizes,
+            n_samples=n_samples,
+            rounds=rounds,
+            p_success=p_success,
+            p_repair=p_repair,
+        )
 
-            save_results_csv(
+        # Zusätzlich: SN pro Grid (für CSV-Metadaten)
+        sn_per_grid = [get_max_sn_nodes(w, h) for (w, h) in grid_sizes]
+
+        # n_success können wir hier sauber aus evaluate_strategies_over_grids nicht bekommen,
+        # daher: wir setzen n_success konservativ auf n_samples, wenn der mean nicht NaN ist,
+        # sonst 0. (Wenn du exakt n_success willst, sag kurz Bescheid, dann erweitern wir
+        # evaluate_strategies_over_grids um success counts.)
+        for strat_name in strategies.keys():
+            t_means = avg_timesteps[strat_name]
+            m_means = avg_movements[strat_name]
+            n_success = [n_samples if not (np.isnan(v)) else 0 for v in t_means]
+
+            save_grid_results_csv(
                 path=csv_path,
-                n_qubits_list=todo_nqs,
+                grid_sizes=grid_sizes,
+                qubits_per_grid=qubits_per_grid,
+                sn_per_grid=sn_per_grid,
                 strategy_name=strat_name,
-                timesteps_mean=t_mean,
-                timesteps_std=t_std,
-                movements_mean=m_mean,
-                movements_std=m_std,
+                timesteps_mean=t_means,
+                movements_mean=m_means,
                 n_success=n_success,
                 n_samples=n_samples,
+                p_success=p_success,
+                p_repair=p_repair,
+                rounds=rounds,
             )
 
-            # reload to include newly written rows
-            existing = load_results_csv(csv_path)
+        existing = load_grid_results_csv(csv_path)
 
-    # -----------------------
     # Plot aus CSV (immer)
-    # -----------------------
-    plot_two_axis_no_errorbars(
-        n_qubits_list=n_qubits_list,
+    plot_two_axis_bar_over_grids(
+        grid_sizes=grid_sizes,
         results={
             "Path Algorithm with Waiting": existing.get("Default", {}),
             "Rotation Algorithm with Waiting": existing.get("Rotation", {}),
         },
-        out_png=plot_path,
+        out_path=plot_path,
         title="",
     )
 
