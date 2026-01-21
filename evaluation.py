@@ -1099,84 +1099,174 @@ def plot_two_axis_no_errorbars(
         plt.show()
 
 
+def save_exception_rates_csv(
+    path: str,
+    n_qubits_list: List[int],
+    exception_rates: Dict[str, List[float]],
+    n_samples: int,
+    width: int,
+    height: int,
+    p_success: float,
+    p_repair: float,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    # Wir überschreiben bewusst, damit es keine Duplikate gibt
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "strategy",
+                "n_qubits",
+                "exception_rate",
+                "n_samples",
+                "width",
+                "height",
+                "p_success",
+                "p_repair",
+            ]
+        )
+
+        for strat_name, rates in exception_rates.items():
+            for nq, rate in zip(n_qubits_list, rates):
+                writer.writerow(
+                    [
+                        strat_name,
+                        nq,
+                        rate,
+                        n_samples,
+                        width,
+                        height,
+                        p_success,
+                        p_repair,
+                    ]
+                )
+
+
+def load_exception_rates_csv(path: str) -> Tuple[List[int], Dict[str, Dict[int, float]], Dict[str, float]]:
+    """
+    Rückgabe:
+      - n_qubits_list: sortierte Liste aller n_qubits aus der CSV
+      - rates[strategy][n_qubits] = exception_rate
+      - meta: dict mit width/height/p_success/p_repair/n_samples (falls vorhanden)
+    """
+    if not os.path.exists(path):
+        return [], {}, {}
+
+    rates: Dict[str, Dict[int, float]] = {}
+    n_qubits_set = set()
+    meta: Dict[str, float] = {}
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            strat = row["strategy"]
+            nq = int(row["n_qubits"])
+            rate = float(row["exception_rate"])
+
+            rates.setdefault(strat, {})
+            rates[strat][nq] = rate
+            n_qubits_set.add(nq)
+
+            # Meta einmalig übernehmen (alle Zeilen haben i.d.R. dieselben Werte)
+            for k in ["n_samples", "width", "height", "p_success", "p_repair"]:
+                if k in row and row[k] != "" and k not in meta:
+                    meta[k] = float(row[k])
+
+    n_qubits_list = sorted(n_qubits_set)
+    return n_qubits_list, rates, meta
+
+def plot_exception_rates_science_style(
+    n_qubits_list: List[int],
+    rates: Dict[str, Dict[int, float]],
+    out_path: str,
+    title: str = "",
+) -> None:
+    with plt.style.context(["science", "nature"]):
+        plt.rcParams.update({
+            "font.size": 11,
+            "axes.labelsize": 11,
+            "axes.titlesize": 11,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "legend.fontsize": 11,
+        })
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        for strat_name, per_nq in rates.items():
+            y = [per_nq.get(nq, np.nan) for nq in n_qubits_list]
+            ax.plot(n_qubits_list, y, marker="o", linestyle="-", label=strat_name)
+
+        ax.set_xlabel("Number of Qubits",labelpad=10)
+        ax.set_ylabel("Fail Rate", labelpad=12)
+        ax.set_title(title)
+        ax.set_xticks(n_qubits_list)
+        ax.set_ylim(-0.05, 1.3)
+        ax.grid(True, which="both", linestyle="--", alpha=0.4)
+        legend = ax.legend(loc="upper left", frameon=True, borderaxespad=1.5,
+            borderpad=0.8, )
+        
+        legend.get_frame().set_facecolor("white")
+        legend.get_frame().set_edgecolor("black")   # optional, aber meist hübsch
+        legend.get_frame().set_alpha(1.0) 
+
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=300)
+        plt.show()
+
 
 def main():
-    # -----------------------
-    # Experiment-Parameter
-    # -----------------------
-    width, height = 3, 3
-    rounds = 5
-    p_success = 0.99
-    p_repair = 0.25
-    n_samples = 50
+    # Output-Dateien
+    csv_path = "exception_rates_3x3.csv"
+    plot_path = "exception_rates_3x3.pdf"
 
-    # Qubit-Spanne: du kannst das hier anpassen
-    n_qubits_list = list(range(2, 25))  # 2..24
+    # Wenn CSV existiert -> nur Plotten
+    n_qubits_list, rates_from_csv, meta = load_exception_rates_csv(csv_path)
 
-    csv_path = "results_strategy_3x3.csv"
-    plot_path = "strategy_3x3_timesteps_movements.pdf"
+    if not n_qubits_list or not rates_from_csv:
+        # ------------------------------------------------------------------
+        # WICHTIG: Ausführung mit DEFAULT PARAMETERN der Funktion
+        # (also ohne Argumente!)
+        # ------------------------------------------------------------------
+        exception_rates = evaluate_exception_rates_for_strategies_3x3()
 
-    # Wenn CSV schon existiert, laden wir sie (damit du plotten kannst ohne neu zu simulieren).
-    existing = load_results_csv(csv_path)
+        # Default-Range dieser Funktion ist 2..24:
+        n_qubits_list = list(range(2, 24 + 1))
 
-    strategies = {
-        "Default": DefaultRoutingPlanner(),
-        "Rotation": RotationRoutingPlanner(),
-    }
+        # Default-Parameter (aus deiner Funktion)
+        width, height = 3, 3
+        n_samples = 100
+        p_success = 0.998
+        p_repair = 0.25
 
-    # -----------------------
-    # Falls Daten fehlen: evaluieren + in CSV schreiben
-    # -----------------------
-    for strat_name, strat in strategies.items():
-        missing_any = (
-            strat_name not in existing
-            or any(nq not in existing[strat_name] for nq in n_qubits_list)
+        save_exception_rates_csv(
+            path=csv_path,
+            n_qubits_list=n_qubits_list,
+            exception_rates=exception_rates,
+            n_samples=n_samples,
+            width=width,
+            height=height,
+            p_success=p_success,
+            p_repair=p_repair,
         )
-        if missing_any:
-            # optional: wenn schon alte Daten drin sind, nicht doppelt schreiben:
-            # => wir schreiben nur die NQs, die fehlen
-            already = existing.get(strat_name, {})
-            todo_nqs = [nq for nq in n_qubits_list if nq not in already]
-            if not todo_nqs:
-                continue
 
-            t_mean, t_std, m_mean, m_std, n_success = evaluate_strategy_with_errorbars(
-                routing_strategy=strat,
-                n_qubits_list=todo_nqs,
-                n_samples=n_samples,
-                width=width,
-                height=height,
-                rounds=rounds,
-                p_success=p_success,
-                p_repair=p_repair,
-            )
+        # Reload, damit Plot garantiert aus CSV kommt
+        n_qubits_list, rates_from_csv, meta = load_exception_rates_csv(csv_path)
 
-            save_results_csv(
-                path=csv_path,
-                n_qubits_list=todo_nqs,
-                strategy_name=strat_name,
-                timesteps_mean=t_mean,
-                timesteps_std=t_std,
-                movements_mean=m_mean,
-                movements_std=m_std,
-                n_success=n_success,
-                n_samples=n_samples,
-            )
+    # Plot immer aus CSV
+    title = ""
+    # Optional: wenn du Metadaten in den Titel willst:
+    # if meta:
+    #     title = (f"Exception-Rate vs Qubits (3x3, RandomPlacement)\n"
+    #              f"p_success={meta.get('p_success', 'NA')}, p_repair={meta.get('p_repair', 'NA')}, "
+    #              f"samples={int(meta.get('n_samples', 0))}")
 
-            # reload to include newly written rows
-            existing = load_results_csv(csv_path)
-
-    # -----------------------
-    # Plot aus CSV (immer)
-    # -----------------------
-    plot_two_axis_no_errorbars(
+    plot_exception_rates_science_style(
         n_qubits_list=n_qubits_list,
-        results={
-            "Path Algorithm with Waiting": existing.get("Default", {}),
-            "Rotation Algorithm with Waiting": existing.get("Rotation", {}),
-        },
-        out_png=plot_path,
-        title="",
+        rates=rates_from_csv,
+        out_path=plot_path,
+        title=title,
     )
 
     print(f"\nCSV gespeichert unter: {os.path.abspath(csv_path)}")

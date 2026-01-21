@@ -1,0 +1,93 @@
+strategy,n_qubits,exception_rate,n_samples,width,height,p_success,p_repair
+Path Algorithm With Waiting,2,0.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,3,0.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,4,0.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,5,0.06,100,3,3,0.998,0.25
+Path Algorithm With Waiting,6,0.1,100,3,3,0.998,0.25
+Path Algorithm With Waiting,7,0.3,100,3,3,0.998,0.25
+Path Algorithm With Waiting,8,0.42,100,3,3,0.998,0.25
+Path Algorithm With Waiting,9,0.55,100,3,3,0.998,0.25
+Path Algorithm With Waiting,10,0.77,100,3,3,0.998,0.25
+Path Algorithm With Waiting,11,0.91,100,3,3,0.998,0.25
+Path Algorithm With Waiting,12,0.94,100,3,3,0.998,0.25
+Path Algorithm With Waiting,13,0.99,100,3,3,0.998,0.25
+Path Algorithm With Waiting,14,1.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,15,1.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,16,1.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,17,1.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,18,1.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,19,1.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,20,1.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,21,1.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,22,1.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,23,1.0,100,3,3,0.998,0.25
+Path Algorithm With Waiting,24,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,2,0.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,3,0.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,4,0.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,5,0.03,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,6,0.07,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,7,0.25,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,8,0.37,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,9,0.52,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,10,0.74,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,11,0.88,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,12,0.92,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,13,0.97,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,14,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,15,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,16,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,17,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,18,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,19,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,20,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,21,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,22,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,23,1.0,100,3,3,0.998,0.25
+Path Algorithm With Rerouting,24,1.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,2,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,3,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,4,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,5,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,6,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,7,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,8,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,9,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,10,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,11,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,12,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,13,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,14,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,15,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,16,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,17,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,18,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,19,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,20,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,21,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,22,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,23,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Waiting,24,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,2,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,3,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,4,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,5,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,6,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,7,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,8,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,9,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,10,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,11,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,12,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,13,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,14,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,15,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,16,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,17,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,18,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,19,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,20,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,21,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,22,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,23,0.0,100,3,3,0.998,0.25
+Rotation Algorithm With Dynamic Cycles,24,0.0,100,3,3,0.998,0.25
