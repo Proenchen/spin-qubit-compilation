@@ -5,9 +5,6 @@ from placements.placement_strategy import PlacementStrategy
 
 
 class RandomPlacementStrategy(PlacementStrategy):
-    """
-    Entspricht deiner bisherigen zufälligen Platzierung.
-    """
 
     def place_qubits(
         self,

@@ -1,10 +1,8 @@
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
-
-import networkx as nx
 
 from routing.routing_strategy import RoutingStrategy
 from placements.placement_strategy import PlacementStrategy
+
 from utils.animation import animate_mapf
 
 
@@ -20,12 +18,6 @@ class SimulationConfig:
 
 
 class RoutingSimulator:
-    """
-    Hauptklasse / Facade:
-      - baut das Netzwerk über die Placement-Strategie
-      - führt Routing über die Routing-Strategie aus
-      - liefert ein SimulationResult mit allem drum und dran
-    """
 
     def __init__(
         self,
@@ -38,7 +30,7 @@ class RoutingSimulator:
         self.config = config
 
     def run(self):
-        # 1) Netzwerk + Qubits + Paare
+        # 1) Network + Qubits + Pairs
         G, qubits, pairs = self.placement_strategy.build_network_and_place(
             width=self.config.width,
             height=self.config.height,
@@ -55,5 +47,8 @@ class RoutingSimulator:
             self.config.p_success,
             self.config.p_repair,
         )
+
+        
+        animate_mapf(G, timelines, edge_timebands=edge_timebands, smooth=True)
 
         return timelines, edge_timebands

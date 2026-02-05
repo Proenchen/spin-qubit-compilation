@@ -7,10 +7,6 @@ import math
 NODE_SIZE = 120
 
 def _build_time_indexed_positions(path):
-    """
-    Turn a path like [(n0,t0), (n1,t1), ...] into a dict t -> position,
-    holding position once agent stops moving.
-    """
     if not path:
         return {}, 0, 0
     t_min = path[0][1]
@@ -24,14 +20,9 @@ def _build_time_indexed_positions(path):
     return per_t, t_min, t_max
 
 def _interpolate(a, b, alpha):
-    """Linear interpolate between 2D points a, b with alpha in [0,1]."""
     return (a[0] + (b[0] - a[0]) * alpha, a[1] + (b[1] - a[1]) * alpha)
 
 def _make_smooth_positions(path, substeps=5):
-    """
-    Build a list of positions including substeps between integer times to get smooth motion.
-    Returns: positions (list of (x,y)), t_frames (list of float timeline frames), last_index (int)
-    """
     if not path:
         return [], [], -1
     per_t, t0, t1 = _build_time_indexed_positions(path)
@@ -49,9 +40,6 @@ def _make_smooth_positions(path, substeps=5):
     return positions, frames, len(positions) - 1
 
 def _make_step_positions(path):
-    """
-    Stepwise (jump-at-integer-time) positions, one frame per integer t.
-    """
     if not path:
         return [], [], -1
     per_t, t0, t1 = _build_time_indexed_positions(path)
@@ -66,8 +54,8 @@ def animate_mapf(
     interval_ms=0.1,
     smooth=True,
     substeps=200,
-    edge_timebands=None,            # [(t_start, t_end, set(frozenset({u,v})))]  mit Halb-Offen: [t_start, t_end)
-    failed_edges_timeline=None,     # {t_int: set(frozenset({u,v}))}
+    edge_timebands=None,           
+    failed_edges_timeline=None,    
 ):
     pos = {n: n for n in G}
 
@@ -145,19 +133,13 @@ def animate_mapf(
         return data["frame_to_pos"][prev]
 
     def defects_for_time(gf):
-        """
-        Liefert defekte Kanten-Segmente für Frame gf.
-        - failed_edges_timeline: direkte, frame-genaue Zuordnung (Zeit = Integer)
-        - edge_timebands: HALB-OFFENE Intervalle [t0, t1) für eindeutige Zustandswechsel je Layer
-        """
         if failed_edges_timeline is not None:
-            tf = int(math.floor(gf + 1e-9))  # deterministisch: vorwärts offene Frames landen im „früheren“ Integer
+            tf = int(math.floor(gf + 1e-9)) 
             failed = failed_edges_timeline.get(tf, set())
         elif edge_timebands is not None:
             tf = int(math.floor(gf + 1e-9))
             failed = set()
             for (t0, t1, edges) in edge_timebands:
-                # Halb-offen: gilt für t0 <= tf < t1
                 if t0 <= tf < t1:
                     failed |= set(edges)
         else:

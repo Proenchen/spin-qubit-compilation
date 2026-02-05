@@ -2,19 +2,9 @@ import networkx as nx
 
 
 class NetworkBuilder:
-    """Builds tiled 8-neighborhood graphs with typed nodes (IN/SN)."""
 
     @staticmethod
     def build_network(width: int, height: int) -> nx.Graph:
-        """
-        Create a width x height tiling of the 8-node pattern (no center),
-        connected with 8-neighborhood edges. Node attribute 'type' ∈ {'IN','SN'}.
-        Corners are 'IN'; others are 'SN'.
-
-        Coordinates follow the original convention:
-        - Each tile is offset by +2 in x for columns
-        - Each tile is offset by -2 in y for rows (so rows go downward)
-        """
         if not (isinstance(width, int) and isinstance(height, int) and width >= 1 and height >= 1):
             raise ValueError("width and height must be integers >= 1")
 
@@ -29,9 +19,9 @@ class NetworkBuilder:
         G = nx.Graph()
 
         # Place tiles in a width x height grid
-        for j in range(height):         # rows
-            for i in range(width):      # columns
-                dx, dy = 2 * i, -2 * j  # keep original spacing/orientation
+        for j in range(height):         
+            for i in range(width):      
+                dx, dy = 2 * i, -2 * j  
                 for t_id, (x, y) in template_pos.items():
                     coord = (x + dx, y + dy)
                     if coord not in G:

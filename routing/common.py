@@ -7,9 +7,6 @@ from typing import Dict, List, Optional, Tuple, Set
 
 import networkx as nx
 
-# --------------------------
-# Type aliases and constants
-# --------------------------
 Coord = Tuple[int, int]
 TimedNode = Tuple[Coord, int]
 
@@ -21,13 +18,6 @@ class Qubit:
     pos: Coord
 
 class Reservations:
-    """
-    Time-indexed reservations for node and edge capacities:
-      - node_caps[node][t] < capacity(node)
-      - edge_caps[{u,v}][t] ∈ {0,1} prevents opposite-direction swaps at the same time
-
-    IN nodes have capacity 2; SN nodes have capacity 1.
-    """
 
     def __init__(self, G: nx.Graph, blocked_edges: Optional[Set[frozenset]] = None) -> None:
         self.node_caps: Dict[Coord, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
@@ -71,11 +61,12 @@ class AStar:
         goal: Coord,
         reservations: Reservations
     ) -> Optional[List[TimedNode]]:
+        
         def h(n: Coord) -> int:
             return max(abs(n[0] - goal[0]), abs(n[1] - goal[1]))
 
         start_state: TimedNode = (start, 0)
-        dist: Dict[TimedNode, Tuple[int, int]] = {start_state: (0, 0)}  # (moves, time)
+        dist: Dict[TimedNode, Tuple[int, int]] = {start_state: (0, 0)}  
         came_from: Dict[TimedNode, TimedNode] = {}
 
         openQueue: List[Tuple[Tuple[int, int], TimedNode]] = []
@@ -97,9 +88,9 @@ class AStar:
                 continue
 
             successors: List[Tuple[Coord, int, int, int]] = []
-            successors.append((node, t + 1, 0, 1))  # wait
+            successors.append((node, t + 1, 0, 1))
             for nbr in G.neighbors(node):
-                successors.append((nbr, t + 1, 1, 1))  # move
+                successors.append((nbr, t + 1, 1, 1)) 
 
             for (n2, t2, dm, dt) in successors:
                 if not reservations.can_occupy(n2, t2):
