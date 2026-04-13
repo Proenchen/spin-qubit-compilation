@@ -15,7 +15,7 @@ from routing.routing_strategy import RoutingStrategy
 from routing.default_routing import DefaultRoutingPlanner
 from routing.routing_with_reroute import RerouteRoutingPlanner
 from routing.rotation_routing import RotationRoutingPlanner
-from routing.rotation_bypass_routing import HybridRotationRoutingPlanner
+from routing.rotation_cycles_routing import HybridRotationRoutingPlanner
 from placements.placement_strategy import PlacementStrategy
 from placements.random_strategy import RandomPlacementStrategy
 from placements.reverse_traversal_strategy import ReverseTraversalPlacementStrategy
@@ -891,7 +891,6 @@ def plot_two_axis_with_errorbars(
             h1 + h2,
             l1 + l2,
             loc="best",
-            fontsize=9,
             frameon=True,
         )
         legend.get_frame().set_facecolor("white")
@@ -912,14 +911,14 @@ def plot_two_axis_no_errorbars(
 ) -> None:
     with plt.style.context(["science", "nature"]):
         plt.rcParams.update({
-            "font.size": 11,       
-            "axes.labelsize": 11,   
-            "axes.titlesize": 11,   
-            "xtick.labelsize": 11,  
-            "ytick.labelsize": 11,
-            "legend.fontsize": 11, 
+            "font.size": 14,       
+            "axes.labelsize": 13,   
+            "axes.titlesize": 12,   
+            "xtick.labelsize": 12,  
+            "ytick.labelsize": 12,
+            "legend.fontsize": 12, 
         })
-        fig, ax1 = plt.subplots(figsize=(10, 6))
+        fig, ax1 = plt.subplots(figsize=(8, 4))
         ax2 = ax1.twinx()
 
         for strat_name, per_nq in results.items():
@@ -952,9 +951,9 @@ def plot_two_axis_no_errorbars(
                 label=f"{strat_name} (Movements)",
             )
 
-        ax1.set_xlabel("Number of Qubits", labelpad=10)
-        ax1.set_ylabel("Mean Timesteps", labelpad=12)
-        ax2.set_ylabel("Mean Movements", labelpad=12)
+        ax1.set_xlabel("Number of Qubits", labelpad=6)
+        ax1.set_ylabel("Mean Timesteps (solid)", labelpad=8)
+        ax2.set_ylabel("Mean Movements (dashed)", labelpad=8)
 
         ax1.set_title(title)
         ax1.set_xticks(n_qubits_list)
@@ -966,8 +965,8 @@ def plot_two_axis_no_errorbars(
             h1 + h2,
             l1 + l2,
             loc="best",
-            borderaxespad=1.5,
-            borderpad=0.8, 
+            borderaxespad=0.7,
+            borderpad=0.5, 
             frameon=True,
         )
         legend.get_frame().set_facecolor("white")
