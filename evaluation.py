@@ -1139,7 +1139,7 @@ def plot_two_axis_no_errorbars_expectation(
                 t_mean,
                 marker="o",
                 linestyle="-",
-                color="#ed9015" if "Rerouting" in strat_name else "tab:blue",
+                color="#ed9015" if "Dynamic" in strat_name else "tab:blue",
                 label=f"{strat_name} (Timesteps)",
             )
 
@@ -1149,17 +1149,16 @@ def plot_two_axis_no_errorbars_expectation(
                 m_mean,
                 marker="s",
                 linestyle="--",
-                color="#ed9015" if "Rerouting" in strat_name else "tab:blue",
+                color="#ed9015" if "Dynamic" in strat_name else "tab:blue",
                 label=f"{strat_name} (Movements)",
             )
 
         ax1.set_xlabel("Expectation Value E of Working Edges", labelpad=6)
         ax1.set_ylabel("Mean Timesteps (solid)", labelpad=8)
         ax2.set_ylabel("Mean Movements (dashed)", labelpad=8)
-        ax1.set_ylim(29,75)
 
         ax1.set_title(title)
-        ax1.set_xticks(expectation_values)
+        ax1.set_xticks([0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0])
         ax1.grid(True, which="both", linestyle="--", alpha=0.4)
 
         h1, l1 = ax1.get_legend_handles_labels()
@@ -1178,7 +1177,7 @@ def plot_two_axis_no_errorbars_expectation(
 
         fig.tight_layout()
         fig.savefig(out_png, dpi=300)
-        plt.ylim(69, 135)
+        plt.ylim(57.5, 81)
         plt.show()
 
 
@@ -1270,23 +1269,23 @@ def main():
     rounds = 5
     n_samples = 100
 
-    min_expectation = 0.8
-    step = 0.025
+    min_expectation = 0.1
+    step = 0.05
 
     # E von 0.40..1.00 in 0.05 Schritten
-    expectation_values = [0.8, 0.83, 0.85, 0.88, 0.9, 0.93, 0.95, 0.98, 1.0]
+    expectation_values = [round(min_expectation + i * step, 2) for i in range(int(round((1.0 - min_expectation) / step)) + 1)]
 
-    csv_path = "results_expectation_paths.csv"
-    plot_path = "expectation_paths.pdf"
+    csv_path = "results_expectation_cycles.csv"
+    plot_path = "expectation_cycles.pdf"
 
     existing = load_results_csv_expectation(csv_path)
 
     strategies = {
-        "Path Algorithm with Waiting": {
+        "Rotation Algorithm with Waiting": {
             "router": DefaultRoutingPlanner(),
             "min_expectation": 0.8,
         },
-        "Path Algorithm with Rerouting": {
+        "Rotation Algorithm with Cyles": {
             "router": RotationRoutingPlanner(),
             "min_expectation": 0.4,
         },
@@ -1337,8 +1336,8 @@ def main():
     plot_two_axis_no_errorbars_expectation(
         expectation_values=expectation_values,
         results={
-            "Path Algorithm with Waiting": existing.get("Path Algorithm with Waiting", {}),
-            "Path Algorithm with Rerouting": existing.get("Path Algorithm with Rerouting", {}),
+            "Rotation Algorithm with Waiting": existing.get("Rotation Algorithm with Waiting", {}),
+            "Rotation Algorithm with Dynamic Cycles": existing.get("Rotation Algorithm with Cyles", {}),
         },
         out_png=plot_path,
         title="",
