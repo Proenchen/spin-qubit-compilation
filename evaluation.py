@@ -1110,15 +1110,15 @@ def plot_two_axis_no_errorbars_expectation(
 ) -> None:
     with plt.style.context(["science", "nature"]):
         plt.rcParams.update({
-            "font.size": 11,
-            "axes.labelsize": 11,
-            "axes.titlesize": 11,
-            "xtick.labelsize": 11,
-            "ytick.labelsize": 11,
-            "legend.fontsize": 11,
+            "font.size": 14,       
+            "axes.labelsize": 13,   
+            "axes.titlesize": 12,   
+            "xtick.labelsize": 12,  
+            "ytick.labelsize": 12,
+            "legend.fontsize": 11.5, 
         })
 
-        fig, ax1 = plt.subplots(figsize=(10, 6))
+        fig, ax1 = plt.subplots(figsize=(8, 5))
         ax2 = ax1.twinx()
 
         for strat_name, per_E in results.items():
@@ -1139,7 +1139,7 @@ def plot_two_axis_no_errorbars_expectation(
                 t_mean,
                 marker="o",
                 linestyle="-",
-                color="#ed9015" if "Rotation" in strat_name else "tab:blue",
+                color="#ed9015" if "Rerouting" in strat_name else "tab:blue",
                 label=f"{strat_name} (Timesteps)",
             )
 
@@ -1149,13 +1149,14 @@ def plot_two_axis_no_errorbars_expectation(
                 m_mean,
                 marker="s",
                 linestyle="--",
-                color="#ed9015" if "Rotation" in strat_name else "tab:blue",
+                color="#ed9015" if "Rerouting" in strat_name else "tab:blue",
                 label=f"{strat_name} (Movements)",
             )
 
-        ax1.set_xlabel("Expectation Value E of Working Edges", labelpad=10)
-        ax1.set_ylabel("Mean Timesteps", labelpad=12)
-        ax2.set_ylabel("Mean Movements", labelpad=12)
+        ax1.set_xlabel("Expectation Value E of Working Edges", labelpad=6)
+        ax1.set_ylabel("Mean Timesteps (solid)", labelpad=8)
+        ax2.set_ylabel("Mean Movements (dashed)", labelpad=8)
+        ax1.set_ylim(29,75)
 
         ax1.set_title(title)
         ax1.set_xticks(expectation_values)
@@ -1167,8 +1168,8 @@ def plot_two_axis_no_errorbars_expectation(
             h1 + h2,
             l1 + l2,
             loc="upper right",
-            borderaxespad=1.5,
-            borderpad=0.8,
+            borderaxespad=0.7,
+            borderpad=0.5,
             frameon=True,
         )
         legend.get_frame().set_facecolor("white")
@@ -1177,7 +1178,7 @@ def plot_two_axis_no_errorbars_expectation(
 
         fig.tight_layout()
         fig.savefig(out_png, dpi=300)
-        plt.ylim(65, 110)
+        plt.ylim(69, 135)
         plt.show()
 
 
@@ -1189,12 +1190,12 @@ def plot_two_axis_no_errorbars(
 ) -> None:
     with plt.style.context(["science", "nature"]):
         plt.rcParams.update({
-            "font.size": 11,        # Grundschrift
-            "axes.labelsize": 11,   # Achsenbeschriftung
-            "axes.titlesize": 11,   # Titel
-            "xtick.labelsize": 11,  # Tick Labels
-            "ytick.labelsize": 11,
-            "legend.fontsize": 11, # Legende
+            "font.size": 14,       
+            "axes.labelsize": 13,   
+            "axes.titlesize": 12,   
+            "xtick.labelsize": 12,  
+            "ytick.labelsize": 12,
+            "legend.fontsize": 12, 
         })
         fig, ax1 = plt.subplots(figsize=(10, 6))
         ax2 = ax1.twinx()
@@ -1232,8 +1233,8 @@ def plot_two_axis_no_errorbars(
             )
 
         ax1.set_xlabel("Number of Qubits", labelpad=10)
-        ax1.set_ylabel("Mean Timesteps", labelpad=12)
-        ax2.set_ylabel("Mean Movements", labelpad=12)
+        ax1.set_ylabel("Mean Timesteps (solid)", labelpad=12)
+        ax2.set_ylabel("Mean Movements (dashed)", labelpad=12)
 
         ax1.set_title(title)
         ax1.set_xticks(n_qubits_list)
@@ -1246,8 +1247,8 @@ def plot_two_axis_no_errorbars(
             h1 + h2,
             l1 + l2,
             loc="best",
-            borderaxespad=1.5,
-            borderpad=0.8, 
+            borderaxespad=0.7,
+            borderpad=0.5, 
             frameon=True,
         )
         legend.get_frame().set_facecolor("white")
@@ -1269,14 +1270,14 @@ def main():
     rounds = 5
     n_samples = 100
 
-    min_expectation = 0.4
-    step = 0.05
+    min_expectation = 0.8
+    step = 0.025
 
     # E von 0.40..1.00 in 0.05 Schritten
-    expectation_values = [round(min_expectation + i * step, 2) for i in range(int(round((1.0 - min_expectation) / step)) + 1)]
+    expectation_values = [0.8, 0.83, 0.85, 0.88, 0.9, 0.93, 0.95, 0.98, 1.0]
 
-    csv_path = "results_expectation_3x3.csv"
-    plot_path = "expectation_3x3_timesteps_movements.pdf"
+    csv_path = "results_expectation_paths.csv"
+    plot_path = "expectation_paths.pdf"
 
     existing = load_results_csv_expectation(csv_path)
 
@@ -1285,7 +1286,7 @@ def main():
             "router": DefaultRoutingPlanner(),
             "min_expectation": 0.8,
         },
-        "Rotation Algorithm with Waiting": {
+        "Path Algorithm with Rerouting": {
             "router": RotationRoutingPlanner(),
             "min_expectation": 0.4,
         },
@@ -1337,7 +1338,7 @@ def main():
         expectation_values=expectation_values,
         results={
             "Path Algorithm with Waiting": existing.get("Path Algorithm with Waiting", {}),
-            "Rotation Algorithm with Waiting": existing.get("Rotation Algorithm with Waiting", {}),
+            "Path Algorithm with Rerouting": existing.get("Path Algorithm with Rerouting", {}),
         },
         out_png=plot_path,
         title="",
