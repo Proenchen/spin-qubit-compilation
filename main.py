@@ -1,8 +1,5 @@
 import random
 
-from typing import List, Tuple
-from routing.common import Qubit
-from utils.network import NetworkBuilder
 from routing.routing_strategy import RoutingStrategy
 from routing.routing_with_reroute import RerouteRoutingPlanner
 from routing.default_routing import DefaultRoutingPlanner
