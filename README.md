@@ -1,6 +1,6 @@
 # Spn Qubit Compilation
 
-This repository contains the implementation of the routing algorithms and inital-mapping techniques described in the paper "_Compilation Techniques for Error Corrected Silicon Spin Qubit Quantum Computers_".
+This repository contains the implementation of the routing algorithms and inital-mapping techniques described in the paper "_Routing Techniques for Error Corrected Silicon Spin Qubit Quantum Architectures_".
 
 ## Usage
 
